@@ -38,6 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 bytes = "1"
 tracing = "0.1"
+vodozemac = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

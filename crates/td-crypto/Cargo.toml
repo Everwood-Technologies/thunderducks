@@ -19,3 +19,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 td-event = { workspace = true }
+vodozemac = { workspace = true }
