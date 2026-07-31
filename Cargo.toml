@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/td-event",
+  "crates/td-crypto",
+  "crates/td-net",
+  "crates/td-node",
+  "crates/td-cli",
+  "relays/td-relay",
+]
+default-members = [
+  "crates/td-event",
+  "crates/td-crypto",
+  "crates/td-net",
+  "crates/td-node",
+  "crates/td-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Everwood-Technologies/thunderducks"
+authors = ["Everwood Technologies"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

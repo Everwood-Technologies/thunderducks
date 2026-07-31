@@ -1,0 +1,13 @@
+[package]
+name = "td-node"
+description = "Node runtime and local RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
