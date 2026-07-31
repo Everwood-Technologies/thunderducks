@@ -23,6 +23,22 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/Everwood-Technologies/thunderducks"
 authors = ["Everwood Technologies"]
 
+[workspace.dependencies]
+td-event = { path = "crates/td-event" }
+td-crypto = { path = "crates/td-crypto" }
+td-net = { path = "crates/td-net" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
+rand = "0.8"
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+bytes = "1"
+tracing = "0.1"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

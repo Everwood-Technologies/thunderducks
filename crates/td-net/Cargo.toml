@@ -11,3 +11,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+td-event = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+td-crypto = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }

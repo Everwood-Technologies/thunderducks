@@ -6,7 +6,7 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 
 ## Status
 
-**MVP construction** (AIDLC Gate 4 approved). Vertical slice in progress.
+**MVP construction** — Wave B (events, identity, P2P frames) landed; Wave C next (E2EE groups).
 
 | Layer | Choice |
 |-------|--------|

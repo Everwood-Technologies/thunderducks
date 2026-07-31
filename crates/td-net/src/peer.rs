@@ -1,0 +1,72 @@
+use crate::frame::{read_event, write_event, FrameError};
+use std::net::SocketAddr;
+use td_event::SignedEvent;
+use thiserror::Error;
+use tokio::net::{TcpListener, TcpStream};
+
+#[derive(Debug, Error)]
+pub enum PeerError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+    #[error("invalid peer uri: {0}")]
+    InvalidUri(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerUri {
+    pub host: String,
+    pub port: u16,
+}
+
+impl PeerUri {
+    pub fn parse(s: &str) -> Result<Self, PeerError> {
+        // td://127.0.0.1:1234 or 127.0.0.1:1234
+        let rest = s.strip_prefix("td://").unwrap_or(s);
+        let (host, port_s) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| PeerError::InvalidUri(s.to_string()))?;
+        let port: u16 = port_s
+            .parse()
+            .map_err(|_| PeerError::InvalidUri(s.to_string()))?;
+        Ok(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    pub fn from_tcp_addr(addr: SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+
+    pub fn to_string_uri(&self) -> String {
+        format!("td://{}:{}", self.host, self.port)
+    }
+
+    pub fn socket_addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+pub async fn dial(uri: &PeerUri) -> Result<TcpStream, PeerError> {
+    Ok(TcpStream::connect(uri.socket_addr()).await?)
+}
+
+pub async fn accept_once(listener: &TcpListener) -> Result<TcpStream, PeerError> {
+    let (s, _) = listener.accept().await?;
+    Ok(s)
+}
+
+/// Simple one-shot: listen, read one event, write it back.
+pub async fn serve_exchange(addr: &str) -> Result<(PeerUri, SignedEvent), PeerError> {
+    let listener = TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    let mut sock = accept_once(&listener).await?;
+    let ev = read_event(&mut sock).await?;
+    write_event(&mut sock, &ev).await?;
+    Ok((PeerUri::from_tcp_addr(local), ev))
+}

@@ -1,6 +1,18 @@
-//! Signed events, per-room DAG, local store traits
+//! Signed events, per-room causal DAG, and SQLite-backed store.
 //!
-//! Part of the Thunderducks MVP (AIDLC Gate 4 construction).
+//! Events are content-addressed by blake3 of the canonical signed payload.
+//! Duplicate ingest is idempotent. No global consensus / blockchain.
+
+mod dag;
+mod event;
+mod store;
+
+pub use dag::{DagError, RoomDag};
+pub use event::{
+    canonical_bytes, event_id_from_bytes, sign_event, verify_event, DeviceId, EventId, EventKind,
+    RoomId, SignedEvent, UnsignedEvent,
+};
+pub use store::{EventStore, MemoryStore, SqliteStore, StoreError};
 
 /// Crate smoke marker used by CI.
 pub fn crate_name() -> &'static str {
@@ -10,9 +22,123 @@ pub fn crate_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn keypair() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
 
     #[test]
     fn smoke_name() {
         assert_eq!(crate_name(), "td-event");
+    }
+
+    #[test]
+    fn sign_verify_and_content_address() {
+        let sk = keypair();
+        let vk = sk.verifying_key();
+        let unsigned = UnsignedEvent {
+            room_id: RoomId::from_bytes([1u8; 32]),
+            parents: vec![],
+            kind: EventKind::Message,
+            payload: br#"{"text":"honk"}"#.to_vec(),
+            author_device: DeviceId::from_verifying_key(&vk),
+            ts_ms: 1,
+        };
+        let signed = sign_event(&sk, unsigned).expect("sign");
+        verify_event(&signed).expect("verify");
+        let id2 = event_id_from_bytes(&canonical_bytes(&signed));
+        assert_eq!(signed.id, id2);
+    }
+
+    #[test]
+    fn reject_bad_signature() {
+        let sk = keypair();
+        let vk = sk.verifying_key();
+        let unsigned = UnsignedEvent {
+            room_id: RoomId::from_bytes([2u8; 32]),
+            parents: vec![],
+            kind: EventKind::Message,
+            payload: b"x".to_vec(),
+            author_device: DeviceId::from_verifying_key(&vk),
+            ts_ms: 1,
+        };
+        let mut signed = sign_event(&sk, unsigned).unwrap();
+        signed.signature[0] ^= 0xff;
+        assert!(verify_event(&signed).is_err());
+    }
+
+    #[test]
+    fn dag_insert_and_dup_drop() {
+        let sk = keypair();
+        let vk = sk.verifying_key();
+        let room = RoomId::from_bytes([3u8; 32]);
+        let mut dag = RoomDag::new(room);
+        let e1 = sign_event(
+            &sk,
+            UnsignedEvent {
+                room_id: room,
+                parents: vec![],
+                kind: EventKind::CreateRoom,
+                payload: b"{}".to_vec(),
+                author_device: DeviceId::from_verifying_key(&vk),
+                ts_ms: 1,
+            },
+        )
+        .unwrap();
+        assert!(dag.ingest(e1.clone()).unwrap());
+        assert!(!dag.ingest(e1.clone()).unwrap(), "dup must be false");
+        let e2 = sign_event(
+            &sk,
+            UnsignedEvent {
+                room_id: room,
+                parents: vec![e1.id],
+                kind: EventKind::Message,
+                payload: b"hi".to_vec(),
+                author_device: DeviceId::from_verifying_key(&vk),
+                ts_ms: 2,
+            },
+        )
+        .unwrap();
+        assert!(dag.ingest(e2).unwrap());
+        assert_eq!(dag.len(), 2);
+    }
+
+    #[test]
+    fn sqlite_crash_safe_reopen() {
+        let dir = std::env::temp_dir().join(format!("td-event-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.sqlite");
+
+        let sk = keypair();
+        let vk = sk.verifying_key();
+        let room = RoomId::from_bytes([4u8; 32]);
+        let e = sign_event(
+            &sk,
+            UnsignedEvent {
+                room_id: room,
+                parents: vec![],
+                kind: EventKind::Message,
+                payload: b"persist".to_vec(),
+                author_device: DeviceId::from_verifying_key(&vk),
+                ts_ms: 9,
+            },
+        )
+        .unwrap();
+        let id = e.id;
+
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            assert!(store.put(e.clone()).unwrap());
+            assert!(!store.put(e).unwrap(), "duplicate put is idempotent");
+        }
+
+        let store2 = SqliteStore::open(&path).unwrap();
+        let loaded = store2.get(&id).unwrap().expect("survives reopen");
+        verify_event(&loaded).unwrap();
+        assert_eq!(loaded.payload, b"persist");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
