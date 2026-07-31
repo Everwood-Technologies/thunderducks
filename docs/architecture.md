@@ -101,3 +101,7 @@ See AIDLC session artifacts for full plan and acceptance criteria.
 
 - `docs/threat-model.md`
 - AIDLC session (operator workspace): gates 0–4 locked under session `d7b503bb-8032-427f-9e58-49033baf68c9`
+
+## Public site (planned)
+
+Docs + marketing will ship via **GitHub Pages** when ready. See `docs/site-and-pages.md`. Not on the critical path for Waves B–F.
