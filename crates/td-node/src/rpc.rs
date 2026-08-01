@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use td_crypto::{
     DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
-    PasskeyRegistry,
+    PasskeyRegistry, RoomOutboundPackage,
 };
 use td_event::{
     sign_event, DeviceId, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
@@ -126,11 +126,16 @@ impl NodeSession {
         self.ts_counter
     }
 
-    /// Ensure we can encrypt for this room (per-sender outbound Megolm).
-    /// Auto share-on-send makes multi-node decrypt work without a Sync button.
+    /// Ensure we can encrypt for this room.
+    /// B2: one shared outbound Megolm per room (create only if missing outbound).
+    /// Auto share-on-send makes multi-node decrypt+shared-send work without Sync.
     fn ensure_room_e2ee(&mut self, room_hex: &str) {
-        if self.e2ee_rooms.contains_key(room_hex) {
+        if self.e2ee.has_outbound(room_hex) {
+            self.e2ee_rooms.insert(room_hex.to_string(), true);
             return;
+        }
+        if self.e2ee_rooms.contains_key(room_hex) {
+            // Marked but outbound missing (should not happen) — recreate.
         }
         let _ = self.e2ee.create_group_session(room_hex);
         self.e2ee_rooms.insert(room_hex.to_string(), true);
@@ -467,9 +472,11 @@ async fn send_message(
     let ts = g.next_ts();
     let room_hex = hex32(&room_id.0);
     g.ensure_room_e2ee(&room_hex);
-    // Export BEFORE encrypt: Megolm session_key() is at the current ratchet
-    // index; post-encrypt export starts after this ciphertext and peers fail.
-    let session_key_b64 = g.e2ee.export_group_session_key(&room_hex).ok();
+    // Export FULL outbound pickle BEFORE encrypt (B2 shared room session).
+    // Peers import outbound so they encrypt with the same session_id; inbound
+    // session_key is included so they can also decrypt. Post-encrypt export
+    // would start after this ciphertext and peers would fail to decrypt it.
+    let room_outbound = g.e2ee.export_room_outbound(&room_hex).ok();
     let plain = serde_json::to_vec(&serde_json::json!({ "text": req.text })).unwrap_or_default();
     let ct = match g.e2ee.megolm_encrypt(&room_hex, &plain) {
         Ok(c) => c,
@@ -540,13 +547,13 @@ async fn send_message(
             };
             let peer_base = rpc.trim_end_matches('/').to_string();
 
-            // 1) Olm-wrap + deliver pre-encrypt Megolm key (must not re-export after ratchet)
+            // 1) Olm-wrap + deliver pre-encrypt shared room outbound (B2)
             if let Err(e) = share_megolm_olm_to_peer(
                 &st,
                 &peer_base,
                 &room_hex,
                 &client,
-                session_key_b64.as_deref(),
+                room_outbound.as_ref(),
             )
             .await
             {
@@ -1320,6 +1327,33 @@ async fn import_session_olm(
     let mut g = st.inner.lock().await;
     match g.e2ee.olm_decrypt(&req.sender_curve25519_b64, &req.olm) {
         Ok(plain) => {
+            // B2 preferred: JSON RoomOutboundPackage (shared outbound pickle).
+            // Legacy: raw UTF-8 Megolm session_key_b64 (inbound only).
+            if let Ok(pkg) = serde_json::from_slice::<RoomOutboundPackage>(&plain) {
+                match g.e2ee.import_room_outbound(&pkg) {
+                    Ok(session_id) => {
+                        g.e2ee_rooms.insert(pkg.room_id.clone(), true);
+                        return Json(serde_json::json!({
+                            "ok": true,
+                            "session_id": session_id,
+                            "path": "olm-room-outbound",
+                            "room_id": pkg.room_id,
+                            "message_index": pkg.message_index,
+                            "has_outbound": g.e2ee.has_outbound(&pkg.room_id),
+                        }))
+                        .into_response();
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorBody {
+                                error: format!("import room outbound: {e}"),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            }
             let key = match std::str::from_utf8(&plain) {
                 Ok(s) => s.to_string(),
                 Err(e) => {
@@ -1358,14 +1392,14 @@ async fn import_session_olm(
     }
 }
 
-/// Establish Olm to peer (fetch their keys) and POST Olm-wrapped Megolm session key.
-/// If `pre_exported_key` is set (send path), use it — do not re-export after encrypt.
+/// Establish Olm to peer and POST Olm-wrapped room outbound (B2) or legacy key.
+/// Prefer `pre_exported` from send path (pre-encrypt snapshot) — do not re-export after ratchet.
 async fn share_megolm_olm_to_peer(
     st: &RpcState,
     peer_base: &str,
     room_hex: &str,
     client: &reqwest::Client,
-    pre_exported_key: Option<&str>,
+    pre_exported: Option<&RoomOutboundPackage>,
 ) -> Result<(String, String), String> {
     let peer_base = peer_base.trim_end_matches('/');
     let keys_http: OlmKeysHttp = client
@@ -1392,16 +1426,18 @@ async fn share_megolm_olm_to_peer(
         g.e2ee
             .establish_olm_outbound(&their)
             .map_err(|e| e.to_string())?;
-        let key = if let Some(k) = pre_exported_key {
-            k.to_string()
+        let body = if let Some(pkg) = pre_exported {
+            serde_json::to_vec(pkg).map_err(|e| e.to_string())?
         } else {
-            g.e2ee
-                .export_group_session_key(room_hex)
-                .map_err(|e| e.to_string())?
+            let pkg = g
+                .e2ee
+                .export_room_outbound(room_hex)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_vec(&pkg).map_err(|e| e.to_string())?
         };
         let ct = g
             .e2ee
-            .olm_encrypt(peer_dev, key.as_bytes())
+            .olm_encrypt(peer_dev, &body)
             .map_err(|e| e.to_string())?;
         let sid = g.e2ee.group_session_id(room_hex).unwrap_or_default();
         let curve = g.e2ee.curve25519_b64();
@@ -1448,7 +1484,7 @@ async fn share_session_with_peer(
             "sender_device": sender,
             "peer_rpc": peer_base,
             "room_id": room_hex,
-            "path": "olm",
+            "path": "olm-room-outbound",
         }))
         .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorBody { error: e })).into_response(),
@@ -1537,19 +1573,14 @@ async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
             };
             let st2 = st.clone();
             tokio::spawn(async move {
-                loop {
-                    match read_event(&mut sock).await {
-                        Ok(ev) => {
-                            let room_id = ev.room_id;
-                            let inserted = {
-                                let mut g = st2.inner.lock().await;
-                                g.ingest_remote(ev).unwrap_or(false)
-                            };
-                            if inserted {
-                                notify_room_from_id(&st2, &room_id).await;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(ev) = read_event(&mut sock).await {
+                    let room_id = ev.room_id;
+                    let inserted = {
+                        let mut g = st2.inner.lock().await;
+                        g.ingest_remote(ev).unwrap_or(false)
+                    };
+                    if inserted {
+                        notify_room_from_id(&st2, &room_id).await;
                     }
                 }
             });

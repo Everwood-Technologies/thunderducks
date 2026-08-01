@@ -36,6 +36,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 |----|------|--------|
 | P3.1 | QUIC transport (TCP framed is MVP fallback) | open |
 | P3.2 | **SSE live message push** (`GET /v1/messages/stream`; WS later) | ✅ done (A2) |
+| P3.2b | **Shared room Megolm ownership** (one outbound session/room) | ✅ done (B2) |
 | P3.3 | Encrypted history catch-up packaging polish | open |
 | P3.4 | Rate limits / authn on node RPC if ever non-localhost |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |

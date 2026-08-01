@@ -8,6 +8,7 @@ mod passkey;
 pub use device::{DeviceBundle, DeviceId, DeviceKeypair};
 pub use e2ee::{
     fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
+    RoomOutboundPackage, ROOM_PICKLE_KEY,
 };
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
 pub use passkey::{
@@ -139,5 +140,52 @@ mod tests {
         // sender can also decrypt via self inbound
         let a_plain = alice.megolm_decrypt(&msg).unwrap();
         assert_eq!(a_plain, b"honk all y'all");
+    }
+
+    /// B2: one shared room outbound — Bob encrypts with Alice's session after pickle import.
+    #[test]
+    fn megolm_shared_room_outbound_b2() {
+        let a = DeviceKeypair::generate();
+        let b = DeviceKeypair::generate();
+        let mut alice = E2eeDevice::new(a.device_id());
+        let mut bob = E2eeDevice::new(b.device_id());
+
+        let bob_keys = bob.publish_keys().unwrap();
+        alice.establish_olm_outbound(&bob_keys).unwrap();
+
+        let room = "room-shared-1";
+        let sid = alice.create_group_session(room);
+        let pkg = alice.export_room_outbound(room).unwrap();
+        assert_eq!(pkg.session_id, sid);
+
+        // Olm-wrap package Alice -> Bob (simulates fanout body)
+        let ct = alice
+            .olm_encrypt(bob.device_id, serde_json::to_vec(&pkg).unwrap().as_slice())
+            .unwrap();
+        let plain = bob.olm_decrypt(&alice.curve25519_b64(), &ct).unwrap();
+        let pkg2: RoomOutboundPackage = serde_json::from_slice(&plain).unwrap();
+        let imported = bob.import_room_outbound(&pkg2).unwrap();
+        assert_eq!(imported, sid);
+        assert!(bob.has_outbound(room));
+        assert_eq!(bob.group_session_id(room).as_deref(), Some(sid.as_str()));
+
+        // Bob encrypts with the shared session; Alice decrypts.
+        let msg = bob.megolm_encrypt(room, b"from bob shared").unwrap();
+        assert_eq!(msg.session_id, sid);
+        let a_plain = alice.megolm_decrypt(&msg).unwrap();
+        assert_eq!(a_plain, b"from bob shared");
+
+        // After Bob encrypts, Alice must adopt Bob's advanced pickle to stay in sync.
+        let advanced = bob.export_room_outbound(room).unwrap();
+        assert!(advanced.message_index > pkg.message_index);
+        alice.import_room_outbound(&advanced).unwrap();
+        assert_eq!(alice.group_message_index(room), bob.group_message_index(room));
+
+        let msg2 = alice.megolm_encrypt(room, b"alice after sync").unwrap();
+        assert_eq!(msg2.session_id, sid);
+        // Bob needs the advanced key after Alice's encrypt for decrypt... Alice index advanced.
+        // Bob still has pre-alice index inbound from initial import — inbound handles future indices.
+        let b_plain = bob.megolm_decrypt(&msg2).unwrap();
+        assert_eq!(b_plain, b"alice after sync");
     }
 }

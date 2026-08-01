@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use vodozemac::megolm::{
-    GroupSession, InboundGroupSession, MegolmMessage, SessionConfig as MegolmConfig, SessionKey,
+    GroupSession, GroupSessionPickle, InboundGroupSession, MegolmMessage,
+    SessionConfig as MegolmConfig, SessionKey,
 };
 use vodozemac::olm::{
     Account, InboundCreationResult, OlmMessage, Session as OlmSession, SessionConfig as OlmConfig,
@@ -34,7 +35,27 @@ pub enum E2eeError {
     Codec(String),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+    #[error("pickle: {0}")]
+    Pickle(String),
 }
+
+/// Portable outbound Megolm state for a room (B2 shared room session).
+/// Contains ratchet + signing keypair — treat like a private key; only share Olm-wrapped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomOutboundPackage {
+    pub v: u8,
+    pub room_id: String,
+    pub session_id: String,
+    pub message_index: u32,
+    /// vodozemac GroupSessionPickle encrypted with [`ROOM_PICKLE_KEY`] (transport still Olm).
+    pub pickle_b64: String,
+    /// Inbound session key at the same ratchet index (decrypt from here forward).
+    pub session_key_b64: String,
+    pub owner_device: DeviceId,
+}
+
+/// Local pickle wrap key — confidentiality relies on Olm wrap in fanout, not this key alone.
+pub const ROOM_PICKLE_KEY: [u8; 32] = *b"td-room-outbound-pickle-v1!!!!!!";
 
 /// Public Olm identity material for a device (Curve25519 sender key + one OTK).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,7 +213,11 @@ impl E2eeDevice {
     }
 
     /// Create outbound Megolm for a room (room_id as hex/string key).
+    /// No-op if this device already has an outbound session for the room (B2).
     pub fn create_group_session(&mut self, room_key: &str) -> String {
+        if let Some(sid) = self.group_session_id(room_key) {
+            return sid;
+        }
         let session = GroupSession::new(MegolmConfig::version_1());
         let sid = session.session_id();
         self.outbound_megolm.insert(room_key.to_string(), session);
@@ -205,17 +230,83 @@ impl E2eeDevice {
         sid
     }
 
+    pub fn has_outbound(&self, room_key: &str) -> bool {
+        self.outbound_megolm.contains_key(room_key)
+    }
+
     pub fn group_session_id(&self, room_key: &str) -> Option<String> {
         self.outbound_megolm.get(room_key).map(|s| s.session_id())
     }
 
-    /// Export Megolm session key (to be Olm-wrapped to each device).
+    pub fn group_message_index(&self, room_key: &str) -> Option<u32> {
+        self.outbound_megolm.get(room_key).map(|s| s.message_index())
+    }
+
+    /// Export Megolm session key (inbound material; to be Olm-wrapped).
     pub fn export_group_session_key(&self, room_key: &str) -> Result<String, E2eeError> {
         let out = self
             .outbound_megolm
             .get(room_key)
             .ok_or_else(|| E2eeError::MissingMegolm(room_key.into()))?;
         Ok(out.session_key().to_base64())
+    }
+
+    /// Export full outbound room session (pickle) for shared-room ownership (B2).
+    pub fn export_room_outbound(
+        &self,
+        room_key: &str,
+    ) -> Result<RoomOutboundPackage, E2eeError> {
+        let out = self
+            .outbound_megolm
+            .get(room_key)
+            .ok_or_else(|| E2eeError::MissingMegolm(room_key.into()))?;
+        let pickle = out.pickle();
+        let pickle_b64 = pickle.encrypt(&ROOM_PICKLE_KEY);
+        Ok(RoomOutboundPackage {
+            v: 1,
+            room_id: room_key.to_string(),
+            session_id: out.session_id(),
+            message_index: out.message_index(),
+            pickle_b64,
+            session_key_b64: out.session_key().to_base64(),
+            owner_device: self.device_id,
+        })
+    }
+
+    /// Import shared room outbound (B2). Accepts same session_id only when advancing.
+    /// Also installs inbound session_key (or_insert — never regress inbound).
+    pub fn import_room_outbound(
+        &mut self,
+        pkg: &RoomOutboundPackage,
+    ) -> Result<String, E2eeError> {
+        if pkg.v != 1 {
+            return Err(E2eeError::Codec(format!("unsupported room outbound v={}", pkg.v)));
+        }
+        // Inbound first so we can decrypt history from this index forward.
+        let _ = self.import_group_session_key(&pkg.session_key_b64)?;
+
+        let pickle = GroupSessionPickle::from_encrypted(&pkg.pickle_b64, &ROOM_PICKLE_KEY)
+            .map_err(|e| E2eeError::Pickle(e.to_string()))?;
+        let session = GroupSession::from_pickle(pickle);
+        if session.session_id() != pkg.session_id {
+            return Err(E2eeError::Codec("pickle session_id mismatch".into()));
+        }
+
+        match self.outbound_megolm.get(&pkg.room_id) {
+            Some(local) if local.session_id() != pkg.session_id => {
+                // Different room session already owned locally — keep local (first-writer wins).
+                return Ok(local.session_id());
+            }
+            Some(local) if local.message_index() > pkg.message_index => {
+                // Local ratchet is ahead; keep local.
+                return Ok(local.session_id());
+            }
+            _ => {
+                self.outbound_megolm
+                    .insert(pkg.room_id.clone(), session);
+            }
+        }
+        Ok(pkg.session_id.clone())
     }
 
     pub fn import_group_session_key(&mut self, session_key_b64: &str) -> Result<String, E2eeError> {
@@ -229,7 +320,7 @@ impl E2eeDevice {
         Ok(sid)
     }
 
-    /// Encrypt room plaintext with Megolm.
+    /// Encrypt room plaintext with Megolm (shared room outbound when present).
     pub fn megolm_encrypt(
         &mut self,
         room_key: &str,
