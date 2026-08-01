@@ -3290,6 +3290,13 @@ async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
     let mut last_apply_ok = None;
     let mut last_apply_ms = None;
     let mut installed_version = None;
+    let mut previous_version = None;
+    let mut previous_path = None;
+    let mut previous_saved_ms = None;
+    let mut last_action = None;
+    let mut last_rollback_ms = None;
+    let mut last_rollback_version = None;
+    let mut can_rollback = false;
     if let Some(p) = ota_state_path(&g.data_dir) {
         if let Ok(raw) = std::fs::read_to_string(p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -3303,10 +3310,54 @@ async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
                     .get("installed_version")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
+                previous_version = v
+                    .get("previous_version")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                previous_path = v
+                    .get("previous_path")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                previous_saved_ms = v.get("previous_saved_ms").and_then(|x| x.as_u64());
+                last_action = v
+                    .get("last_action")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                last_rollback_ms = v.get("last_rollback_ms").and_then(|x| x.as_u64());
+                last_rollback_version = v
+                    .get("last_rollback_version")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
                 if let Some(a) = v.get("available") {
                     available = serde_json::from_value::<OtaManifest>(a.clone()).ok();
                 }
             }
+        }
+    }
+    // Prefer live previous binary on disk over state alone.
+    if let Some(dir) = g.data_dir.as_ref() {
+        let prev_bin = dir.root().join("ota").join("previous").join("tducks.bin");
+        let meta = dir.root().join("ota").join("previous").join("meta.json");
+        if prev_bin.is_file() {
+            can_rollback = true;
+            if previous_path.is_none() {
+                previous_path = Some(prev_bin.display().to_string());
+            }
+            if previous_version.is_none() {
+                if let Ok(raw) = std::fs::read_to_string(&meta) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        previous_version = v
+                            .get("version")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string());
+                        if previous_saved_ms.is_none() {
+                            previous_saved_ms = v.get("saved_ms").and_then(|x| x.as_u64());
+                        }
+                    }
+                }
+            }
+        } else if let Some(ref p) = previous_path {
+            can_rollback = PathBuf::from(p).is_file();
         }
     }
     let pending = ota_pending_path(&g.data_dir)
@@ -3333,6 +3384,13 @@ async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
         "last_apply_ok": last_apply_ok,
         "last_apply_ms": last_apply_ms,
         "installed_version": installed_version,
+        "previous_version": previous_version,
+        "previous_path": previous_path,
+        "previous_saved_ms": previous_saved_ms,
+        "can_rollback": can_rollback,
+        "last_action": last_action,
+        "last_rollback_ms": last_rollback_ms,
+        "last_rollback_version": last_rollback_version,
         "helper_result": helper_result,
         "last_error": last_error,
     }))
@@ -3604,6 +3662,7 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
 
     if auto {
         let pending = serde_json::json!({
+            "action": "apply",
             "version": manifest.version,
             "staged_path": staged,
             "restart": do_restart,
@@ -3690,6 +3749,219 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
     .into_response()
 }
 
+/// Roll back to the previous binary saved by the last successful apply.
+async fn ota_rollback(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner(&mut g, &headers) {
+            return *resp;
+        }
+    }
+
+    let g = st.inner.lock().await;
+    let Some(dir) = g.data_dir.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "data dir required for OTA rollback".into(),
+            }),
+        )
+            .into_response();
+    };
+
+    let data_root = dir.root().to_path_buf();
+    let ota_dir = data_root.join("ota");
+    let prev_bin = ota_dir.join("previous").join("tducks.bin");
+    let prev_meta = ota_dir.join("previous").join("meta.json");
+    let pending_path = ota_dir.join("pending.json");
+    let state_path = data_root.join("ota-state.json");
+
+    if pending_path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "OTA pending already exists; wait for apply/rollback to finish".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    if !prev_bin.is_file() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "no previous binary available for rollback".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut previous_version = "unknown".to_string();
+    if let Ok(raw) = std::fs::read_to_string(&prev_meta) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
+                if !ver.is_empty() {
+                    previous_version = ver.to_string();
+                }
+            }
+        }
+    }
+    // Fallback: ota-state.json
+    if previous_version == "unknown" {
+        if let Ok(raw) = std::fs::read_to_string(&state_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(ver) = v.get("previous_version").and_then(|x| x.as_str()) {
+                    if !ver.is_empty() {
+                        previous_version = ver.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let from_version = {
+        if let Ok(raw) = std::fs::read_to_string(&state_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                v.get("installed_version")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(current_package_version)
+            } else {
+                current_package_version()
+            }
+        } else {
+            current_package_version()
+        }
+    };
+
+    let do_restart = match std::env::var("TD_OTA_RESTART") {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            !(t == "0" || t == "false" || t == "no" || t == "off")
+        }
+        Err(_) => true,
+    };
+
+    let pending = serde_json::json!({
+        "action": "rollback",
+        "version": previous_version,
+        "from_version": from_version,
+        "staged_path": prev_bin.display().to_string(),
+        "restart": do_restart,
+        "requested_ms": now_ms(),
+    });
+
+    if let Err(e) = std::fs::create_dir_all(&ota_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("create ota dir: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::write(
+        &pending_path,
+        serde_json::to_vec_pretty(&pending).unwrap_or_default(),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("write pending.json: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o640));
+    }
+
+    let mut helper_started = false;
+    let mut helper_error: Option<String> = None;
+    let (apply_mode, apply_note) = {
+        let kick = tokio::process::Command::new("systemctl")
+            .args(["start", "tducks-ota-apply.service"])
+            .output()
+            .await;
+        match kick {
+            Ok(out) if out.status.success() => {
+                helper_started = true;
+                (
+                    "rolling_back",
+                    "tducks-ota-apply.service started (rollback + restart)".to_string(),
+                )
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                helper_error = Some(if err.is_empty() {
+                    format!("systemctl start exit {}", out.status)
+                } else {
+                    err
+                });
+                (
+                    "pending",
+                    format!(
+                        "pending.json written; systemctl start failed ({}) — ensure tducks-ota-apply.path is enabled",
+                        helper_error.as_deref().unwrap_or("?")
+                    ),
+                )
+            }
+            Err(e) => {
+                helper_error = Some(format!("systemctl not available: {e}"));
+                (
+                    "pending",
+                    "pending.json written; no systemctl — run scripts/tducks-ota-apply.sh as root"
+                        .to_string(),
+                )
+            }
+        }
+    };
+
+    // Merge note into ota-state without wiping previous_* fields.
+    let mut st_val = serde_json::json!({});
+    if let Ok(raw) = std::fs::read_to_string(&state_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            st_val = v;
+        }
+    }
+    if let Some(obj) = st_val.as_object_mut() {
+        obj.insert("last_apply".into(), serde_json::json!(apply_note));
+        obj.insert("last_apply_ok".into(), serde_json::json!(true));
+        obj.insert("last_error".into(), serde_json::json!(helper_error));
+        obj.insert(
+            "pending".into(),
+            serde_json::json!({
+                "action": "rollback",
+                "path": pending_path.display().to_string(),
+                "restart": do_restart,
+                "version": previous_version,
+            }),
+        );
+    }
+    let _ = std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&st_val).unwrap_or_default(),
+    );
+    drop(g);
+
+    Json(serde_json::json!({
+        "ok": true,
+        "action": "rollback",
+        "version": previous_version,
+        "from_version": from_version,
+        "staged_path": prev_bin.display().to_string(),
+        "restart": do_restart,
+        "pending_written": true,
+        "helper_started": helper_started,
+        "mode": apply_mode,
+        "note": apply_note,
+        "helper_error": helper_error,
+    }))
+    .into_response()
+}
+
 /// Build the localhost RPC router.
 pub fn router(state: RpcState) -> Router {
     let cors = CorsLayer::new()
@@ -3742,6 +4014,7 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/ota", get(ota_status))
         .route("/v1/ota/check", post(ota_check))
         .route("/v1/ota/apply", post(ota_apply))
+        .route("/v1/ota/rollback", post(ota_rollback))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authn_rate_middleware,
