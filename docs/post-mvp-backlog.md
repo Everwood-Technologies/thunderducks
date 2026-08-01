@@ -39,6 +39,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.2c | **Pond packaging** (linux amd64/arm64 release + systemd DIY install) | ✅ done (C) |
 | P3.2d | **First-run claim + pairing UI** | ✅ done |
 | P3.2e | **Durable claim + identity** (`TD_DATA_DIR`) | ✅ done |
+| P3.2f | **Recovery login + owner session** | ✅ done |
 | P3.3 | Encrypted history catch-up packaging polish | open |
 | P3.4 | Rate limits / authn on node RPC if ever non-localhost |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |

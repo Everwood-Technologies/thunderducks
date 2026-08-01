@@ -117,11 +117,21 @@ With a node running and the web client pointed at it (`?rpc=`):
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET/POST | `/v1/claim` | Status / claim owner |
-| GET/POST | `/v1/pair` | List / mint pair token |
+| GET/POST | `/v1/claim` | Status / claim owner (mints owner session on claim) |
+| POST | `/v1/recovery/login` | Unlock with recovery code → owner session token |
+| GET/DELETE | `/v1/owner/session` | Check / revoke owner session (`Authorization: Bearer`) |
+| GET/POST | `/v1/pair` | List / mint pair token (**POST requires owner session**) |
 | POST | `/v1/pair/redeem` | Redeem pair token |
 
 Recovery code is shown **once** at claim; only a hash is stored on the node.
+
+### Recovery login (owner session)
+
+1. Claim (or later: enter recovery code) → node returns `owner_token` (24h, in-memory).
+2. Web stores it in `sessionStorage`; send as `Authorization: Bearer <token>` or `x-td-owner-token`.
+3. **Pair device** mint requires a valid owner session (chat/list still open on localhost trust model).
+4. Restart wipes sessions → unlock again with the recovery code (`?unlock=1` forces the UI).
+5. Failed logins: 5 strikes → 60s lockout (in-memory).
 
 ### Durable claim + identity
 
@@ -141,7 +151,7 @@ Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
 
 Pair tokens remain short-lived and in-memory by design.
 
-**Still later Pond phases:** recovery-login path, OTA, Wi‑Fi wizard, tailnet/relay UX.
+**Still later Pond phases:** full RPC authn (not just pair mint), OTA, Wi‑Fi wizard, tailnet/relay UX.
 
 ## Security notes
 

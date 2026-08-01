@@ -3,7 +3,7 @@
 //! Binds localhost only. In-memory single-device session for MVP smoke.
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -103,6 +103,11 @@ struct NodeSession {
     claim: ClaimState,
     /// Active short-lived pairing invites (token -> meta).
     pair_tokens: HashMap<String, PairToken>,
+    /// Active owner sessions (token -> meta). Minted by claim or recovery login.
+    owner_sessions: HashMap<String, OwnerSession>,
+    /// Recovery login failure throttle (in-memory).
+    recovery_failures: u32,
+    recovery_lock_until: Option<Instant>,
     /// Optional durable store (identity + claim). None = pure in-memory.
     data_dir: Option<NodeDataDir>,
 }
@@ -135,6 +140,9 @@ impl NodeSession {
             rpc_base: None,
             claim,
             pair_tokens: HashMap::new(),
+            owner_sessions: HashMap::new(),
+            recovery_failures: 0,
+            recovery_lock_until: None,
             data_dir,
         }
     }
@@ -158,6 +166,71 @@ impl NodeSession {
     fn purge_expired_pair_tokens(&mut self) {
         let now = Instant::now();
         self.pair_tokens.retain(|_, t| t.expires_at > now);
+    }
+
+    fn purge_expired_owner_sessions(&mut self) {
+        let now = Instant::now();
+        self.owner_sessions.retain(|_, s| s.expires_at > now);
+    }
+
+    fn mint_owner_session(&mut self, source: &str) -> (String, u64) {
+        self.purge_expired_owner_sessions();
+        // Cap concurrent owner sessions.
+        if self.owner_sessions.len() >= 16 {
+            if let Some(oldest) = self
+                .owner_sessions
+                .iter()
+                .min_by_key(|(_, s)| s.created_ms)
+                .map(|(k, _)| k.clone())
+            {
+                self.owner_sessions.remove(&oldest);
+            }
+        }
+        let ttl_secs = 86_400u64; // 24h
+        let token = random_token_hex(24);
+        self.owner_sessions.insert(
+            token.clone(),
+            OwnerSession {
+                source: source.to_string(),
+                created_ms: now_ms(),
+                expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            },
+        );
+        (token, ttl_secs)
+    }
+
+    fn owner_session_valid(&mut self, token: &str) -> bool {
+        self.purge_expired_owner_sessions();
+        self.owner_sessions
+            .get(token)
+            .is_some_and(|s| s.expires_at > Instant::now())
+    }
+
+    fn revoke_owner_session(&mut self, token: &str) -> bool {
+        self.owner_sessions.remove(token).is_some()
+    }
+
+    fn recovery_locked(&self) -> Option<u64> {
+        let until = self.recovery_lock_until?;
+        let now = Instant::now();
+        if until > now {
+            Some(until.saturating_duration_since(now).as_secs().max(1))
+        } else {
+            None
+        }
+    }
+
+    fn note_recovery_failure(&mut self) {
+        self.recovery_failures = self.recovery_failures.saturating_add(1);
+        if self.recovery_failures >= 5 {
+            self.recovery_lock_until = Some(Instant::now() + Duration::from_secs(60));
+            self.recovery_failures = 0;
+        }
+    }
+
+    fn note_recovery_success(&mut self) {
+        self.recovery_failures = 0;
+        self.recovery_lock_until = None;
     }
 
     fn next_ts(&mut self) -> u64 {
@@ -267,7 +340,6 @@ pub(crate) struct ClaimState {
     pub(crate) claimed: bool,
     pub(crate) display_name: Option<String>,
     /// blake3 hex of recovery code (never store plaintext).
-    #[allow(dead_code)] // reserved for future recovery-login path
     pub(crate) recovery_hash: Option<String>,
     pub(crate) claimed_at_ms: Option<u64>,
 }
@@ -278,6 +350,13 @@ struct PairToken {
     expires_at: Instant,
     created_ms: u64,
     redeemed_by: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnerSession {
+    source: String,
+    created_ms: u64,
+    expires_at: Instant,
 }
 
 fn now_ms() -> u64 {
@@ -524,6 +603,9 @@ struct ClaimResponse {
     recovery_code: String,
     device_id: String,
     claimed_at_ms: u64,
+    /// Owner session token (also set on first claim so the claimer is unlocked).
+    owner_token: String,
+    expires_in_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -538,6 +620,61 @@ struct ClaimStatusResponse {
     rpc_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     p2p_uri: Option<String>,
+    /// True when recovery hash is present (login available).
+    recovery_login: bool,
+}
+
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let rest = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))?;
+    let t = rest.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn extract_owner_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = extract_bearer(headers) {
+        return Some(t);
+    }
+    headers
+        .get("x-td-owner-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Require a valid owner session. Returns 401 body on failure.
+fn require_owner(
+    g: &mut NodeSession,
+    headers: &HeaderMap,
+) -> Result<(), Box<axum::response::Response>> {
+    let Some(token) = extract_owner_token(headers) else {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "owner session required (Authorization: Bearer <token>)".into(),
+                }),
+            )
+                .into_response(),
+        ));
+    };
+    if !g.owner_session_valid(&token) {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "invalid or expired owner session".into(),
+                }),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
 }
 
 async fn claim_status(State(st): State<RpcState>) -> impl IntoResponse {
@@ -549,6 +686,7 @@ async fn claim_status(State(st): State<RpcState>) -> impl IntoResponse {
         device_id: hex32(&g.keypair.device_id().0),
         rpc_base: g.rpc_base.clone(),
         p2p_uri: g.p2p_uri.clone(),
+        recovery_login: g.claim.claimed && g.claim.recovery_hash.is_some(),
     })
 }
 
@@ -610,6 +748,7 @@ async fn claim_node(
         )
             .into_response();
     }
+    let (owner_token, expires_in_secs) = g.mint_owner_session("claim");
     Json(ClaimResponse {
         ok: true,
         claimed: true,
@@ -617,8 +756,157 @@ async fn claim_node(
         recovery_code: code,
         device_id: hex32(&g.keypair.device_id().0),
         claimed_at_ms: at,
+        owner_token,
+        expires_in_secs,
     })
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryLoginRequest {
+    recovery_code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryLoginResponse {
+    ok: bool,
+    owner_token: String,
+    expires_in_secs: u64,
+    display_name: Option<String>,
+    device_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerSessionStatus {
+    ok: bool,
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_in_secs: Option<u64>,
+    claimed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+}
+
+async fn recovery_login(
+    State(st): State<RpcState>,
+    Json(req): Json<RecoveryLoginRequest>,
+) -> impl IntoResponse {
+    let code = req.recovery_code.trim();
+    if code.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "recovery_code required".into(),
+            }),
+        )
+            .into_response();
+    }
+    let mut g = st.inner.lock().await;
+    if let Some(secs) = g.recovery_locked() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorBody {
+                error: format!("too many failed attempts; retry in {secs}s"),
+            }),
+        )
+            .into_response();
+    }
+    if !g.claim.claimed {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "node not claimed".into(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(expected) = g.claim.recovery_hash.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "recovery login not configured".into(),
+            }),
+        )
+            .into_response();
+    };
+    let got = hash_recovery(code);
+    // Constant-time-ish compare on hex strings.
+    let ok = got.len() == expected.len()
+        && got
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes().iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if !ok {
+        g.note_recovery_failure();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "invalid recovery code".into(),
+            }),
+        )
+            .into_response();
+    }
+    g.note_recovery_success();
+    let (owner_token, expires_in_secs) = g.mint_owner_session("recovery");
+    Json(RecoveryLoginResponse {
+        ok: true,
+        owner_token,
+        expires_in_secs,
+        display_name: g.claim.display_name.clone(),
+        device_id: hex32(&g.keypair.device_id().0),
+    })
+    .into_response()
+}
+
+async fn owner_session_status(
+    State(st): State<RpcState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let token = extract_owner_token(&headers);
+    let (authenticated, source, expires_in_secs) = match token {
+        Some(t) if g.owner_session_valid(&t) => {
+            let meta = g.owner_sessions.get(&t).cloned();
+            let (src, exp) = meta
+                .map(|m| {
+                    let secs = m
+                        .expires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_secs();
+                    (Some(m.source), Some(secs))
+                })
+                .unwrap_or((None, None));
+            (true, src, exp)
+        }
+        _ => (false, None, None),
+    };
+    Json(OwnerSessionStatus {
+        ok: true,
+        authenticated,
+        source,
+        expires_in_secs,
+        claimed: g.claim.claimed,
+        display_name: g.claim.display_name.clone(),
+    })
+}
+
+async fn owner_logout(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let Some(token) = extract_owner_token(&headers) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "owner token required".into(),
+            }),
+        )
+            .into_response();
+    };
+    let revoked = g.revoke_owner_session(&token);
+    Json(serde_json::json!({ "ok": true, "revoked": revoked })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,6 +929,7 @@ struct PairCreateResponse {
 
 async fn pair_create(
     State(st): State<RpcState>,
+    headers: HeaderMap,
     Json(req): Json<PairCreateRequest>,
 ) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
@@ -652,6 +941,9 @@ async fn pair_create(
             }),
         )
             .into_response();
+    }
+    if let Err(resp) = require_owner(&mut g, &headers) {
+        return *resp;
     }
     g.purge_expired_pair_tokens();
     let ttl = req.ttl_secs.unwrap_or(600).clamp(60, 3600);
@@ -1926,6 +2218,8 @@ pub fn router(state: RpcState) -> Router {
         )
         .route("/v1/status", get(status))
         .route("/v1/claim", get(claim_status).post(claim_node))
+        .route("/v1/recovery/login", post(recovery_login))
+        .route("/v1/owner/session", get(owner_session_status).delete(owner_logout))
         .route("/v1/pair", get(pair_list).post(pair_create))
         .route("/v1/pair/redeem", post(pair_redeem))
         .route("/v1/devices", get(list_devices))

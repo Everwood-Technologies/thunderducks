@@ -247,6 +247,8 @@ mod tests {
             assert_eq!(claim["ok"], true);
             assert_eq!(claim["claimed"], true);
             assert!(claim["recovery_code"].as_str().unwrap().len() >= 8);
+            let owner_token = claim["owner_token"].as_str().unwrap().to_string();
+            assert!(owner_token.len() >= 32);
 
             let st2: StatusResponse = client
                 .get(format!("{base}/v1/status"))
@@ -259,8 +261,18 @@ mod tests {
             assert!(st2.claimed);
             assert_eq!(st2.display_name.as_deref(), Some("Test Pond"));
 
+            // Pair mint requires owner session.
+            let unauth = client
+                .post(format!("{base}/v1/pair"))
+                .json(&serde_json::json!({"label": "phone", "ttl_secs": 120}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
             let pair: serde_json::Value = client
                 .post(format!("{base}/v1/pair"))
+                .header("Authorization", format!("Bearer {owner_token}"))
                 .json(&serde_json::json!({"label": "phone", "ttl_secs": 120}))
                 .send()
                 .await
@@ -372,6 +384,127 @@ mod tests {
             assert!(claim_raw.contains("Durable Pond"));
             assert!(!claim_raw.contains(&recovery));
             assert!(!claim_raw.to_lowercase().contains("recovery_code"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn recovery_login_mints_owner_session() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "td-recovery-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let client = reqwest::Client::new();
+
+            let addr = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind");
+            let base = format!("http://{addr}");
+
+            let claim: serde_json::Value = client
+                .post(format!("{base}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Recover Me"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let recovery = claim["recovery_code"].as_str().unwrap().to_string();
+            let claim_owner = claim["owner_token"].as_str().unwrap().to_string();
+
+            // Wrong code → 401
+            let bad = client
+                .post(format!("{base}/v1/recovery/login"))
+                .json(&serde_json::json!({"recovery_code": "AAAA-BBBB-CCCC-DDDD"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            // Fresh process-like restart: new listener, same data dir (sessions wiped).
+            let addr2 = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind2");
+            let base2 = format!("http://{addr2}");
+
+            // Old claim-minted token invalid on new process
+            let stale = client
+                .get(format!("{base2}/v1/owner/session"))
+                .header("Authorization", format!("Bearer {claim_owner}"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            assert_eq!(stale["authenticated"], false);
+
+            let login: serde_json::Value = client
+                .post(format!("{base2}/v1/recovery/login"))
+                .json(&serde_json::json!({"recovery_code": recovery}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(login["ok"], true);
+            let owner = login["owner_token"].as_str().unwrap().to_string();
+            assert!(owner.len() >= 32);
+            assert_eq!(login["display_name"], "Recover Me");
+
+            let sess: serde_json::Value = client
+                .get(format!("{base2}/v1/owner/session"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(sess["authenticated"], true);
+            assert_eq!(sess["source"], "recovery");
+
+            let pair: serde_json::Value = client
+                .post(format!("{base2}/v1/pair"))
+                .header("x-td-owner-token", &owner)
+                .json(&serde_json::json!({"label": "after-recovery"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(pair["ok"], true);
+
+            let logout: serde_json::Value = client
+                .delete(format!("{base2}/v1/owner/session"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(logout["revoked"], true);
+
+            let after = client
+                .post(format!("{base2}/v1/pair"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .json(&serde_json::json!({"label": "nope"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(after.status(), reqwest::StatusCode::UNAUTHORIZED);
 
             let _ = std::fs::remove_dir_all(&dir);
         });

@@ -23,6 +23,7 @@ export type ClaimStatus = {
   device_id: string;
   rpc_base?: string | null;
   p2p_uri?: string | null;
+  recovery_login?: boolean;
 };
 
 export type ClaimResponse = {
@@ -32,7 +33,45 @@ export type ClaimResponse = {
   recovery_code: string;
   device_id: string;
   claimed_at_ms: number;
+  owner_token: string;
+  expires_in_secs: number;
 };
+
+export type RecoveryLoginResponse = {
+  ok: boolean;
+  owner_token: string;
+  expires_in_secs: number;
+  display_name?: string | null;
+  device_id: string;
+};
+
+export type OwnerSessionStatus = {
+  ok: boolean;
+  authenticated: boolean;
+  source?: string | null;
+  expires_in_secs?: number | null;
+  claimed: boolean;
+  display_name?: string | null;
+};
+
+const OWNER_TOKEN_KEY = "td_owner_token";
+
+export function loadOwnerToken(): string | null {
+  try {
+    return sessionStorage.getItem(OWNER_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function saveOwnerToken(token: string | null): void {
+  try {
+    if (token) sessionStorage.setItem(OWNER_TOKEN_KEY, token);
+    else sessionStorage.removeItem(OWNER_TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
 
 export type PairCreateResponse = {
   ok: boolean;
@@ -75,10 +114,28 @@ export type WaitMessagesResponse = MessagesResponse & {
 };
 
 export class TdRpcClient {
-  constructor(public baseUrl: string) {}
+  ownerToken: string | null = null;
+
+  constructor(public baseUrl: string, ownerToken?: string | null) {
+    this.ownerToken = ownerToken ?? loadOwnerToken();
+  }
 
   private url(path: string): string {
     return `${this.baseUrl.replace(/\/$/, "")}${path}`;
+  }
+
+  private authHeaders(extra?: Record<string, string>): Record<string, string> {
+    const h: Record<string, string> = { ...(extra ?? {}) };
+    if (this.ownerToken) {
+      h.Authorization = `Bearer ${this.ownerToken}`;
+      h["x-td-owner-token"] = this.ownerToken;
+    }
+    return h;
+  }
+
+  setOwnerToken(token: string | null): void {
+    this.ownerToken = token;
+    saveOwnerToken(token);
   }
 
   async health(): Promise<boolean> {
@@ -295,13 +352,53 @@ export class TdRpcClient {
       const err = await r.text();
       throw new Error(`claim HTTP ${r.status}: ${err}`);
     }
-    return (await r.json()) as ClaimResponse;
+    const res = (await r.json()) as ClaimResponse;
+    if (res.owner_token) this.setOwnerToken(res.owner_token);
+    return res;
+  }
+
+  async recoveryLogin(recoveryCode: string): Promise<RecoveryLoginResponse> {
+    const r = await fetch(this.url("/v1/recovery/login"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recovery_code: recoveryCode }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`recovery login HTTP ${r.status}: ${err}`);
+    }
+    const res = (await r.json()) as RecoveryLoginResponse;
+    if (res.owner_token) this.setOwnerToken(res.owner_token);
+    return res;
+  }
+
+  async ownerSession(): Promise<OwnerSessionStatus> {
+    const r = await fetch(this.url("/v1/owner/session"), {
+      headers: this.authHeaders(),
+    });
+    if (!r.ok) throw new Error(`owner session HTTP ${r.status}`);
+    return (await r.json()) as OwnerSessionStatus;
+  }
+
+  async ownerLogout(): Promise<void> {
+    if (!this.ownerToken) {
+      this.setOwnerToken(null);
+      return;
+    }
+    try {
+      await fetch(this.url("/v1/owner/session"), {
+        method: "DELETE",
+        headers: this.authHeaders(),
+      });
+    } finally {
+      this.setOwnerToken(null);
+    }
   }
 
   async pairCreate(label = "device", ttlSecs = 600): Promise<PairCreateResponse> {
     const r = await fetch(this.url("/v1/pair"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ label, ttl_secs: ttlSecs }),
     });
     if (!r.ok) {
@@ -349,7 +446,7 @@ function mountClaimWizard(root: HTMLElement, client: TdRpcClient): void {
       try {
         const res = await client.claim(name);
         out.textContent =
-          `Claimed "${res.display_name}"\n\nRECOVERY CODE (save now — shown once):\n${res.recovery_code}\n\ndevice ${res.device_id.slice(0, 16)}…`;
+          `Claimed "${res.display_name}"\n\nRECOVERY CODE (save now — shown once):\n${res.recovery_code}\n\ndevice ${res.device_id.slice(0, 16)}…\nowner session ${res.expires_in_secs}s`;
         const btn = document.createElement("button");
         btn.textContent = "Continue to chat";
         btn.style.marginTop = "0.75rem";
@@ -359,6 +456,38 @@ function mountClaimWizard(root: HTMLElement, client: TdRpcClient): void {
         out.textContent = `claim failed: ${(e as Error).message}`;
       }
     })();
+  });
+}
+
+/** Unlock claimed Pond with recovery code (owner session). */
+function mountUnlockWizard(root: HTMLElement, client: TdRpcClient, pondName?: string | null): void {
+  const title = pondName ? `Unlock "${pondName}"` : "Unlock Pond";
+  root.innerHTML = `
+    <h1>${title}</h1>
+    <p style="color:#444">This node is claimed. Enter the recovery code to unlock owner actions (pair device).</p>
+    <p style="font-size:0.9rem">RPC <code>${client.baseUrl}</code></p>
+    <label>Recovery code<br/><input id="code" autocomplete="off" spellcheck="false" style="min-width:18rem;font-family:monospace" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" /></label>
+    <div style="margin-top:0.75rem">
+      <button id="unlock">Unlock</button>
+      <button id="skip" style="margin-left:0.5rem">Continue without unlock</button>
+    </div>
+    <pre id="out" style="margin-top:1rem"></pre>
+  `;
+  const out = root.querySelector("#out") as HTMLPreElement;
+  root.querySelector("#unlock")!.addEventListener("click", () => {
+    const code = (root.querySelector("#code") as HTMLInputElement).value.trim();
+    void (async () => {
+      try {
+        const res = await client.recoveryLogin(code);
+        out.textContent = `Unlocked "${res.display_name ?? pondName ?? "Pond"}" · session ${res.expires_in_secs}s`;
+        mountChatUi(root, client);
+      } catch (e) {
+        out.textContent = `unlock failed: ${(e as Error).message}`;
+      }
+    })();
+  });
+  root.querySelector("#skip")!.addEventListener("click", () => {
+    mountChatUi(root, client);
   });
 }
 
@@ -409,6 +538,8 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
     <div>
       <button id="link">Link secondary</button>
       <button id="pair">Pair device</button>
+      <button id="unlock">Unlock / re-login</button>
+      <button id="logout">Owner logout</button>
       <button id="room">Create room</button>
       <button id="sync">Sync peers (manual)</button>
       <button id="refresh">Refresh msgs</button>
@@ -600,11 +731,24 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
     })();
   };
 
-  void client.status().then((st) => {
+  const refreshStatus = async () => {
+    const st = await client.status();
     const pond = st.display_name ? ` · ${st.display_name}` : "";
+    let owner = "owner=no";
+    if (client.ownerToken) {
+      try {
+        const sess = await client.ownerSession();
+        owner = sess.authenticated
+          ? `owner=yes(${sess.source ?? "?"},${sess.expires_in_secs ?? "?"}s)`
+          : "owner=stale";
+      } catch {
+        owner = "owner=?";
+      }
+    }
     (root.querySelector("#status") as HTMLElement).textContent =
-      `device ${st.device_id.slice(0, 12)}…${pond} events=${st.event_count} e2ee=${st.e2ee_default ?? false} claimed=${st.claimed ?? false} p2p=${st.p2p_uri ?? "—"}`;
-  });
+      `device ${st.device_id.slice(0, 12)}…${pond} events=${st.event_count} e2ee=${st.e2ee_default ?? false} claimed=${st.claimed ?? false} ${owner} p2p=${st.p2p_uri ?? "—"}`;
+  };
+  void refreshStatus();
 
   root.querySelector("#link")!.addEventListener("click", () => {
     void client
@@ -624,8 +768,18 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
           /* ignore */
         }
       } catch (e) {
-        log(`pair fail: ${(e as Error).message}`);
+        log(`pair fail: ${(e as Error).message} (unlock with recovery code if needed)`);
       }
+    })();
+  });
+  root.querySelector("#unlock")!.addEventListener("click", () => {
+    mountUnlockWizard(root, client);
+  });
+  root.querySelector("#logout")!.addEventListener("click", () => {
+    void (async () => {
+      await client.ownerLogout();
+      log("owner session cleared");
+      await refreshStatus();
     })();
   });
   root.querySelector("#room")!.addEventListener("click", () => {
@@ -709,6 +863,22 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       const st = await client.claimStatus();
       if (!st.claimed) {
         mountClaimWizard(root, client);
+        return;
+      }
+      // Claimed: unlock if no valid owner session (or force via ?unlock=1).
+      const forceUnlock = params.get("unlock") === "1";
+      let authed = false;
+      if (client.ownerToken && !forceUnlock) {
+        try {
+          const sess = await client.ownerSession();
+          authed = sess.authenticated === true;
+          if (!authed) client.setOwnerToken(null);
+        } catch {
+          authed = false;
+        }
+      }
+      if (!authed || forceUnlock) {
+        mountUnlockWizard(root, client, st.display_name);
       } else {
         mountChatUi(root, client);
       }
