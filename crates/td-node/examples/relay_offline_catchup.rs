@@ -32,6 +32,57 @@ impl Drop for RelayProc {
     }
 }
 
+fn resolve_td_relay_bin() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(explicit) = std::env::var("TD_RELAY_BIN") {
+        return Ok(explicit);
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // CARGO_MANIFEST_DIR = .../crates/td-node → repo root target/
+    let mut from_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    from_manifest.pop(); // crates
+    from_manifest.pop(); // repo root
+    from_manifest.push("target");
+    from_manifest.push("debug");
+    from_manifest.push("td-relay");
+    candidates.push(from_manifest);
+
+    // cwd-relative (CI often runs from repo root)
+    candidates.push(PathBuf::from("target/debug/td-relay"));
+    candidates.push(PathBuf::from("./target/debug/td-relay"));
+
+    // current_exe dir siblings (when invoked as target/debug/examples/relay_offline_catchup)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // .../target/debug/examples → .../target/debug/td-relay
+            let mut p = exe_dir.to_path_buf();
+            if p.file_name().and_then(|s| s.to_str()) == Some("examples") {
+                p.pop();
+            }
+            p.push("td-relay");
+            candidates.push(p);
+            // also one more up just in case
+            let mut p2 = exe_dir.to_path_buf();
+            p2.pop();
+            p2.push("td-relay");
+            candidates.push(p2);
+        }
+    }
+
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.to_string_lossy().into_owned());
+        }
+    }
+
+    Err(format(
+        "td-relay binary not found; tried: {:?} — run: cargo build -p td-relay --bins",
+        candidates,
+    )
+    .into())
+}
+
 fn spawn_relay_binary() -> Result<RelayProc, Box<dyn std::error::Error>> {
     // Pick a free port.
     let port = {
@@ -42,20 +93,12 @@ fn spawn_relay_binary() -> Result<RelayProc, Box<dyn std::error::Error>> {
     let db = std::env::temp_dir().join(format!("td-p13-relay-{port}.sqlite"));
     let _ = std::fs::remove_file(&db);
 
-    let bin = std::env::var("TD_RELAY_BIN").unwrap_or_else(|_| {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // crates/td-node -> repo root
-        p.pop();
-        p.pop();
-        p.push("target");
-        p.push("debug");
-        p.push("td-relay");
-        p.to_string_lossy().into_owned()
-    });
+    let bin = resolve_td_relay_bin()?;
     if !PathBuf::from(&bin).exists() {
-        return Err(
-            format!("td-relay binary missing at {bin}; run: cargo build -p td-relay").into(),
-        );
+        return Err(format!(
+            "td-relay binary missing at {bin}; run: cargo build -p td-relay --bins"
+        )
+        .into());
     }
 
     let child = Command::new(&bin)

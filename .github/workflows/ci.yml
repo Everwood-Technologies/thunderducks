@@ -69,9 +69,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: build relay + P1 examples
-        run: cargo build -p td-relay -p td-node --examples
+      - name: build relay binary
+        run: cargo build -p td-relay --bins
+      - name: build P1 examples
+        run: cargo build -p td-node --examples
       - name: P1.2 two-user P2P
         run: ./target/debug/examples/two_user_p2p
       - name: P1.3 relay offline catch-up
-        run: ./target/debug/examples/relay_offline_catchup
+        run: |
+          test -x ./target/debug/td-relay
+          TD_RELAY_BIN="$PWD/target/debug/td-relay" ./target/debug/examples/relay_offline_catchup
