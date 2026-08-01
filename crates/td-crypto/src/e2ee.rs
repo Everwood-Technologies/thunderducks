@@ -239,7 +239,9 @@ impl E2eeDevice {
     }
 
     pub fn group_message_index(&self, room_key: &str) -> Option<u32> {
-        self.outbound_megolm.get(room_key).map(|s| s.message_index())
+        self.outbound_megolm
+            .get(room_key)
+            .map(|s| s.message_index())
     }
 
     /// Export Megolm session key (inbound material; to be Olm-wrapped).
@@ -252,10 +254,7 @@ impl E2eeDevice {
     }
 
     /// Export full outbound room session (pickle) for shared-room ownership (B2).
-    pub fn export_room_outbound(
-        &self,
-        room_key: &str,
-    ) -> Result<RoomOutboundPackage, E2eeError> {
+    pub fn export_room_outbound(&self, room_key: &str) -> Result<RoomOutboundPackage, E2eeError> {
         let out = self
             .outbound_megolm
             .get(room_key)
@@ -275,12 +274,12 @@ impl E2eeDevice {
 
     /// Import shared room outbound (B2). Accepts same session_id only when advancing.
     /// Also installs inbound session_key (or_insert — never regress inbound).
-    pub fn import_room_outbound(
-        &mut self,
-        pkg: &RoomOutboundPackage,
-    ) -> Result<String, E2eeError> {
+    pub fn import_room_outbound(&mut self, pkg: &RoomOutboundPackage) -> Result<String, E2eeError> {
         if pkg.v != 1 {
-            return Err(E2eeError::Codec(format!("unsupported room outbound v={}", pkg.v)));
+            return Err(E2eeError::Codec(format!(
+                "unsupported room outbound v={}",
+                pkg.v
+            )));
         }
         // Inbound first so we can decrypt history from this index forward.
         let _ = self.import_group_session_key(&pkg.session_key_b64)?;
@@ -302,8 +301,7 @@ impl E2eeDevice {
                 return Ok(local.session_id());
             }
             _ => {
-                self.outbound_megolm
-                    .insert(pkg.room_id.clone(), session);
+                self.outbound_megolm.insert(pkg.room_id.clone(), session);
             }
         }
         Ok(pkg.session_id.clone())

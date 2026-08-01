@@ -179,7 +179,10 @@ mod tests {
         let advanced = bob.export_room_outbound(room).unwrap();
         assert!(advanced.message_index > pkg.message_index);
         alice.import_room_outbound(&advanced).unwrap();
-        assert_eq!(alice.group_message_index(room), bob.group_message_index(room));
+        assert_eq!(
+            alice.group_message_index(room),
+            bob.group_message_index(room)
+        );
 
         let msg2 = alice.megolm_encrypt(room, b"alice after sync").unwrap();
         assert_eq!(msg2.session_id, sid);
