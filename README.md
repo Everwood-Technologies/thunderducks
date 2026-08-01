@@ -6,7 +6,7 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 
 ## Status
 
-**MVP construction** — Waves A–F landed (core through widgets/bot/harness). MVP vertical slice complete (M5).
+**M5 accepted (with caveats)** — Waves A–F shipped. See [`docs/mvp-accept.md`](./docs/mvp-accept.md) and [`docs/post-mvp-backlog.md`](./docs/post-mvp-backlog.md).
 
 | Layer | Choice |
 |-------|--------|
@@ -14,7 +14,7 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 | Events | Signed events + per-room causal DAG |
 | Crypto | vodozemac (Olm/MegOlm), 1:1 **and groups** |
 | Transport | P2P-first; optional untrusted relay assist |
-| Identity | Passkeys + multi-device (≥2) |
+| Identity | Multi-device (≥2); passkeys **stubbed** as device-link (WebAuthn later) |
 | Clients | CLI (`tducks`) + TypeScript web |
 | Widgets | iframe + JS SDK (deny-by-default) |
 | License | **AGPL-3.0-only** |
@@ -65,6 +65,15 @@ cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
 - Mandatory global DHT
 - Tauri / mobile store apps
 - Perfect metadata privacy
+
+## Docs
+
+- [MVP accept checklist](./docs/mvp-accept.md)
+- [Post-MVP backlog](./docs/post-mvp-backlog.md)
+- [Benches](./docs/bench.md)
+- [Threat model](./docs/threat-model.md)
+- [Architecture](./docs/architecture.md)
+- [Security policy](./SECURITY.md)
 
 ## License
 

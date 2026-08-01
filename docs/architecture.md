@@ -71,7 +71,7 @@ clients/
 
 ## Identity & multi-device
 
-- User root: passkey / WebAuthn (TS enrollment primary)
+- User root: passkey / WebAuthn (target); **MVP uses device-link stub** until WebAuthn lands
 - Per-device identity + E2EE keys
 - New device: approve from existing device; encrypted history catch-up
 - CLI: browser-assisted link flow
@@ -79,7 +79,7 @@ clients/
 ## Clients
 
 - **CLI (`tducks`):** developer and headless paths
-- **Web TS:** passkeys + rooms UX; talks to **local `td-node` RPC** (HTTP+SSE/JSON bias)
+- **Web TS:** rooms UX + device-link; talks to **local `td-node` RPC** (HTTP JSON; SSE later)
 - Tauri deferred
 
 ## Widgets & bots
