@@ -40,6 +40,6 @@ Recorded against `main` (Waves A–F + P1.2/P1.3 harness). Legend: ✅ met · �
 
 ## MVP claim
 
-**M5 vertical slice: ACCEPTED with caveats.** P1.2–P1.4 landed. Strongest remaining caveats: default CLI/web path is **signed plaintext** over localhost RPC/raw TCP (vodozemac tested but not default wire path); passkeys stubbed; not production-ready.
+**M5 vertical slice: ACCEPTED with caveats.** P1.1–P1.4 + Pages landed. Default RPC message path is **Megolm**; WebAuthn ceremony on RPC; transport still raw TCP; not production-ready.
 
 Next: `docs/post-mvp-backlog.md`, `docs/threat-model-diff.md`.

@@ -16,7 +16,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Why | Effort |
 |----|------|-----|--------|
-| P1.1 | **WebAuthn / passkeys** (replace device-link stub as primary UX) | Gate 3 identity lock; docs still say passkeys | M–L; keep device-link as recovery |
+| P1.1 | **WebAuthn / passkeys** | ✅ RPC ceremony + ES256 verify (`td-crypto` passkey); device-link remains multi-device | done |
 | P1.2 | **True multi-user P2P demo script** | ✅ done — `scripts/two-user-p2p.sh` + `td-node` example `two_user_p2p` | done |
 | P1.3 | **Relay + P2P coexistence script** | ✅ done — `scripts/relay-offline-catchup.sh` + example `relay_offline_catchup` | done |
 | P1.4 | Threat-model ↔ impl **diff pass** | ✅ done — `docs/threat-model-diff.md` | done |
@@ -25,7 +25,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Why |
 |----|------|-----|
-| P2.1 | **GitHub Pages** flip | ✅ done — `site/` + `.github/workflows/pages.yml` |
+| P2.1 | **GitHub Pages** flip | ✅ done — `site/` + pages workflow; live site |
 | P2.2 | Expand CONTRIBUTING (widget/bot test commands, harness) | Onboarding |
 | P2.3 | Protocol notes (event encoding, room membership, relay envelope) | External contributors |
 | P2.4 | README badges (CI, license, pages when live) | Polish |
@@ -48,10 +48,11 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 2. P0.2 SECURITY.md ✅  
 3. P1.2/P1.3 harness glue ✅  
 4. P1.4 threat-model ↔ impl diff ✅  
-5. P2.1 Pages when you want a public face  
-6. P1.1 WebAuthn when identity UX matters  
-7. High/prod from P1.4: encrypt RPC payloads + transport auth  
-8. P3.* as interest/funding allows  
+5. P2.1 Pages ✅  
+6. P1.1 WebAuthn ✅  
+7. High/prod from P1.4: encrypt RPC payloads ✅ (Megolm default); transport auth still open  
+8. P0.3 healthcheck (ops)  
+9. P3.* as interest/funding allows  
 
 ## Out of scope forever (unless new Gate)
 

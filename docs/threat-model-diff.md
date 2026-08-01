@@ -137,12 +137,22 @@ Legend: ✅ met · ⚠️ partial / MVP-honest gap · ❌ missing / contradicts 
 | Relays untrusted | ✅ remains (API/DB); seal quality caveat documented |
 | Widgets denied keys | ✅ unchanged |
 
-**M5 remains accepted with caveats.** Stronger caveat language: **default product path is signed plaintext events over localhost RPC and raw TCP P2P; vodozemac is implemented and tested but not the default wire path for CLI/web yet.**
+**M5 remains accepted with caveats.**
+
+## Update (2026-08-01 later — P1.1 + payload E2EE + Pages)
+
+| Prior gap | Now |
+|-----------|-----|
+| RPC signed plaintext default | ✅ **Megolm by default** on `/v1/messages`; list decrypts on node |
+| Passkeys stubbed | ✅ **WebAuthn ceremony** on `/v1/passkeys/*` (ES256 register/auth); device-link remains multi-device |
+| GitHub Pages deferred | ✅ https://everwood-technologies.github.io/thunderducks/ |
+| Transport Noise/TLS/QUIC | ❌ still open |
+| RPC authn if non-localhost | ❌ still open |
+| Relay seal XOR demo | ⚠️ still demo-grade for assist envelopes |
 
 ---
 
 ## Sign-off
 
 - Diff performed against threat model priority order and architecture locks.  
-- No change to cryptographic libraries required for this doc-only pass.  
-- Next engineering priority if hardening: **encrypt event payloads on send** + **transport auth**, then WebAuthn.
+- Follow-up: payload E2EE + WebAuthn RPC shipped; next hardening is **transport auth** + non-localhost RPC authn.

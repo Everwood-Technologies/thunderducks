@@ -7,6 +7,8 @@ export type Status = {
   rooms: string[];
   linked_devices: string[];
   peers: { name: string; uri: string }[];
+  passkey_credentials?: number;
+  e2ee_default?: boolean;
 };
 
 export type CreateRoomResponse = { room_id: string; event_id: string };
@@ -79,6 +81,33 @@ export class TdRpcClient {
     return (await r.json()) as MessagesResponse;
   }
 
+  async passkeyRegisterBegin(
+    userName = "thunderducks-user",
+    displayName = "Thunderducks User",
+  ): Promise<{
+    challenge: string;
+    rp: { id: string; name: string };
+    user: { id: string; name: string; display_name: string };
+  }> {
+    const r = await fetch(this.url("/v1/passkeys/register/begin"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_name: userName, display_name: displayName }),
+    });
+    if (!r.ok) throw new Error(`passkey begin HTTP ${r.status}`);
+    return (await r.json()) as {
+      challenge: string;
+      rp: { id: string; name: string };
+      user: { id: string; name: string; display_name: string };
+    };
+  }
+
+  async passkeyList(): Promise<{ credentials: { credential_id: string; label: string }[] }> {
+    const r = await fetch(this.url("/v1/passkeys"));
+    if (!r.ok) throw new Error(`passkey list HTTP ${r.status}`);
+    return (await r.json()) as { credentials: { credential_id: string; label: string }[] };
+  }
+
   async addPeer(name: string, uri: string): Promise<void> {
     const r = await fetch(this.url("/v1/peers"), {
       method: "POST",
@@ -107,7 +136,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
   let roomId: string | null = null;
   void client.status().then((st) => {
     (root.querySelector("#status") as HTMLElement).textContent =
-      `device ${st.device_id.slice(0, 12)}… events=${st.event_count}`;
+      `device ${st.device_id.slice(0, 12)}… events=${st.event_count} e2ee=${st.e2ee_default ?? false} passkeys=${st.passkey_credentials ?? 0}`;
   });
   root.querySelector("#link")!.addEventListener("click", () => {
     void client.linkSecondary().then((r) => log(`linked secondary ${r.secondary_device.slice(0, 12)}…`));

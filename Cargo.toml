@@ -44,6 +44,8 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

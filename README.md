@@ -14,9 +14,9 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 |-------|--------|
 | Core | Rust-first monorepo |
 | Events | Signed events + per-room causal DAG |
-| Crypto | vodozemac (Olm/MegOlm), 1:1 **and groups** |
+| Crypto | vodozemac (Olm/MegOlm); **RPC messages Megolm by default** |
 | Transport | P2P-first; optional untrusted relay assist |
-| Identity | Multi-device (≥2); passkeys **stubbed** as device-link (WebAuthn later) |
+| Identity | Multi-device (≥2); WebAuthn/passkey RPC + device-link |
 | Clients | CLI (`tducks`) + TypeScript web |
 | Widgets | iframe + JS SDK (deny-by-default) |
 | License | **AGPL-3.0-only** |

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use td_crypto::{DeviceKeypair, LinkRegistry};
+use td_crypto::{DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, PasskeyRegistry};
 use td_event::{
     sign_event, DeviceId, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
@@ -32,6 +32,10 @@ struct NodeSession {
     /// room_id hex -> last parents (tips) cache via node
     peers: HashMap<String, String>,
     link: LinkRegistry,
+    passkeys: PasskeyRegistry,
+    e2ee: E2eeDevice,
+    /// rooms with outbound Megolm session established
+    e2ee_rooms: HashMap<String, bool>,
     ts_counter: u64,
 }
 
@@ -41,12 +45,16 @@ impl NodeSession {
         let mut link = LinkRegistry::new(keypair.device_id());
         let _ = link.trust_local(&keypair);
         let node = DeviceNode::from_crypto_device(keypair.device_id());
+        let e2ee = E2eeDevice::new(keypair.device_id());
         Self {
             keypair,
             node,
             rooms: RoomRegistry::new(),
             peers: HashMap::new(),
             link,
+            passkeys: PasskeyRegistry::localhost_default(),
+            e2ee,
+            e2ee_rooms: HashMap::new(),
             ts_counter: 1,
         }
     }
@@ -54,6 +62,14 @@ impl NodeSession {
     fn next_ts(&mut self) -> u64 {
         self.ts_counter += 1;
         self.ts_counter
+    }
+
+    fn ensure_room_e2ee(&mut self, room_hex: &str) {
+        if self.e2ee_rooms.contains_key(room_hex) {
+            return;
+        }
+        let _ = self.e2ee.create_group_session(room_hex);
+        self.e2ee_rooms.insert(room_hex.to_string(), true);
     }
 }
 
@@ -65,6 +81,8 @@ pub struct StatusResponse {
     pub rooms: Vec<String>,
     pub linked_devices: Vec<String>,
     pub peers: Vec<PeerInfo>,
+    pub passkey_credentials: usize,
+    pub e2ee_default: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,8 +174,43 @@ fn parse_room_id(s: &str) -> Result<RoomId, String> {
 }
 
 fn payload_text(ev: &SignedEvent) -> String {
-    // Try JSON {"text":...} else utf8 lossy
+    // Legacy plaintext path: JSON {"text":...} else utf8 lossy
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&ev.payload) {
+        if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+            return t.to_string();
+        }
+    }
+    String::from_utf8_lossy(&ev.payload).into_owned()
+}
+
+fn decrypt_message_text(e2ee: &mut E2eeDevice, ev: &SignedEvent) -> String {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&ev.payload) {
+        if v.get("enc").and_then(|x| x.as_str()) == Some("megolm") {
+            let session_id = v
+                .get("session_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let ciphertext_b64 = v
+                .get("ciphertext_b64")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let ct = MegolmCiphertext {
+                sender_device: td_crypto::DeviceId(ev.author_device.0),
+                session_id,
+                ciphertext_b64,
+            };
+            if let Ok(plain) = e2ee.megolm_decrypt(&ct) {
+                if let Ok(pv) = serde_json::from_slice::<serde_json::Value>(&plain) {
+                    if let Some(t) = pv.get("text").and_then(|x| x.as_str()) {
+                        return t.to_string();
+                    }
+                }
+                return String::from_utf8_lossy(&plain).into_owned();
+            }
+            return "[e2ee:decrypt-failed]".into();
+        }
         if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
             return t.to_string();
         }
@@ -189,6 +242,8 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         rooms,
         linked_devices: linked,
         peers,
+        passkey_credentials: g.passkeys.credential_count(),
+        e2ee_default: true,
     })
 }
 
@@ -255,7 +310,29 @@ async fn send_message(
     }
     let parents: Vec<EventId> = g.node.tips(&room_id);
     let ts = g.next_ts();
-    let payload = serde_json::to_vec(&serde_json::json!({ "text": req.text })).unwrap_or_default();
+    let room_hex = hex32(&room_id.0);
+    g.ensure_room_e2ee(&room_hex);
+    let plain = serde_json::to_vec(&serde_json::json!({ "text": req.text })).unwrap_or_default();
+    let ct = match g.e2ee.megolm_encrypt(&room_hex, &plain) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: format!("e2ee encrypt: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "enc": "megolm",
+        "session_id": ct.session_id,
+        "ciphertext_b64": ct.ciphertext_b64,
+        "sender_device": hex32(&ct.sender_device.0),
+    }))
+    .unwrap_or_default();
     let unsigned = UnsignedEvent {
         room_id,
         parents,
@@ -298,7 +375,7 @@ async fn list_messages(
     State(st): State<RpcState>,
     Json(req): Json<RoomQuery>,
 ) -> impl IntoResponse {
-    let g = st.inner.lock().await;
+    let mut g = st.inner.lock().await;
     let room_id = match parse_room_id(&req.room_id) {
         Ok(r) => r,
         Err(e) => {
@@ -309,11 +386,14 @@ async fn list_messages(
         .node
         .list_messages(&room_id)
         .into_iter()
-        .map(|ev| MessageView {
-            event_id: hex32(&ev.id.0),
-            author: hex32(&ev.author_device.0),
-            ts_ms: ev.ts_ms,
-            text: payload_text(&ev),
+        .map(|ev| {
+            let text = decrypt_message_text(&mut g.e2ee, &ev);
+            MessageView {
+                event_id: hex32(&ev.id.0),
+                author: hex32(&ev.author_device.0),
+                ts_ms: ev.ts_ms,
+                text,
+            }
         })
         .collect();
     Json(MessagesResponse {
@@ -384,6 +464,132 @@ async fn list_devices(State(st): State<RpcState>) -> impl IntoResponse {
     Json(serde_json::json!({ "devices": devices })).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterBeginRequest {
+    #[serde(default = "default_user")]
+    pub user_name: String,
+    #[serde(default = "default_display")]
+    pub display_name: String,
+}
+
+fn default_user() -> String {
+    "thunderducks-user".into()
+}
+fn default_display() -> String {
+    "Thunderducks User".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterFinishRequest {
+    pub challenge: String,
+    pub credential_id: String,
+    pub client_data_json: String,
+    pub authenticator_data: String,
+    pub public_key_spki: String,
+    #[serde(default = "default_label")]
+    pub label: String,
+}
+
+fn default_label() -> String {
+    "primary".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyAuthFinishRequest {
+    pub challenge: String,
+    pub credential_id: String,
+    pub client_data_json: String,
+    pub authenticator_data: String,
+    pub signature: String,
+}
+
+async fn passkey_register_begin(
+    State(st): State<RpcState>,
+    Json(req): Json<PasskeyRegisterBeginRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let opts = g
+        .passkeys
+        .begin_registration(&req.user_name, &req.display_name);
+    Json(opts).into_response()
+}
+
+async fn passkey_register_finish(
+    State(st): State<RpcState>,
+    Json(req): Json<PasskeyRegisterFinishRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    match g.passkeys.finish_registration(
+        &req.challenge,
+        &req.credential_id,
+        &req.client_data_json,
+        &req.authenticator_data,
+        &req.public_key_spki,
+        &req.label,
+    ) {
+        Ok(stored) => Json(serde_json::json!({
+            "ok": true,
+            "credential_id": td_crypto::b64url(&stored.credential_id),
+            "label": stored.label,
+            "count": g.passkeys.credential_count(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn passkey_auth_begin(State(st): State<RpcState>) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let opts = g.passkeys.begin_authentication();
+    Json(opts).into_response()
+}
+
+async fn passkey_auth_finish(
+    State(st): State<RpcState>,
+    Json(req): Json<PasskeyAuthFinishRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    match g.passkeys.finish_authentication(
+        &req.challenge,
+        &req.credential_id,
+        &req.client_data_json,
+        &req.authenticator_data,
+        &req.signature,
+    ) {
+        Ok(cred) => Json(serde_json::json!({"ok": true, "credential_id": cred})).into_response(),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn passkey_list(State(st): State<RpcState>) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    let creds: Vec<_> = g
+        .passkeys
+        .list_credentials()
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "credential_id": td_crypto::b64url(&c.credential_id),
+                "label": c.label,
+                "sign_count": c.sign_count,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"credentials": creds})).into_response()
+}
+
 /// Build the localhost RPC router.
 pub fn router(state: RpcState) -> Router {
     let cors = CorsLayer::new()
@@ -398,6 +604,14 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/link-secondary", post(link_secondary))
+        .route("/v1/passkeys/register/begin", post(passkey_register_begin))
+        .route(
+            "/v1/passkeys/register/finish",
+            post(passkey_register_finish),
+        )
+        .route("/v1/passkeys/auth/begin", post(passkey_auth_begin))
+        .route("/v1/passkeys/auth/finish", post(passkey_auth_finish))
+        .route("/v1/passkeys", get(passkey_list))
         .route("/v1/peers", post(add_peer))
         .route("/v1/rooms", post(create_room))
         .route("/v1/messages", post(send_message))

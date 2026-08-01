@@ -25,7 +25,15 @@ Open `index.html` (after `npm run build`) with `?rpc=http://127.0.0.1:8788` for 
 | POST | `/v1/devices/link-secondary` | multi-device link |
 | POST | `/v1/peers` | remember peer URI |
 | POST | `/v1/rooms` | create room |
-| POST | `/v1/messages` | send text |
-| POST | `/v1/messages/list` | recv/list |
+| POST | `/v1/messages` | send text (Megolm-encrypted payload) |
+| POST | `/v1/messages/list` | recv/list (decrypt on node) |
+| POST | `/v1/passkeys/register/begin` | WebAuthn creation options |
+| POST | `/v1/passkeys/register/finish` | store credential |
+| POST | `/v1/passkeys/auth/begin` | WebAuthn request options |
+| POST | `/v1/passkeys/auth/finish` | verify assertion |
+| GET | `/v1/passkeys` | list credentials |
 
-Passkeys are stubbed as device-link for MVP; full WebAuthn lands later.
+Messages on `/v1/messages` are **Megolm-encrypted** by default (node decrypts for list).
+
+Passkeys: RPC `/v1/passkeys/*` supports WebAuthn register/auth ceremony (ES256).
+Browser `navigator.credentials` UI can call begin/finish; device-link remains for multi-device.

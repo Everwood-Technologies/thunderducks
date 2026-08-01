@@ -3,12 +3,17 @@
 mod device;
 mod e2ee;
 mod link;
+mod passkey;
 
 pub use device::{DeviceBundle, DeviceId, DeviceKeypair};
 pub use e2ee::{
     fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
 };
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
+pub use passkey::{
+    b64url, PasskeyError, PasskeyRegistry, PublicKeyCredentialCreationOptions,
+    PublicKeyCredentialRequestOptions, StoredCredential,
+};
 
 /// Crate smoke marker used by CI.
 pub fn crate_name() -> &'static str {
