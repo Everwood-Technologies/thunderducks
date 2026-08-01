@@ -72,10 +72,12 @@ A small **network appliance** (commodity mini PC + our image) that ships ready f
 |------|--------|
 | Source of truth | **Pond node**, never the phone |
 | Arch priority | **amd64 first**, arm64 second |
-| Network default | **Ethernet required** for setup; Wi‑Fi optional add-on |
-| Remote access | Tailnet and/or Thunderducks relay — **not** “open random WAN ports” as default |
+| Brand | **Thunderducks Pond** (not a quieter sub-brand) |
+| Network default | **Ethernet preferred** for setup; **Wi‑Fi included on Mini v1** (setup can complete on Wi‑Fi) |
+| Remote access | **Both:** Tailscale-class tailnet **and** first-party Thunderducks relay — **not** “open random WAN ports” as default |
+| Retail anchor | **$299** Pond Mini; ongoing revenue via **purchasable feature packs** |
 | SSH on retail | **Off or setup-local only** by default; advanced toggle |
-| License | Software **AGPL-3.0**; hardware + support are the SKU |
+| License | Software **AGPL-3.0**; hardware + support + feature packs are the SKU |
 | Custom PCB v1 | **No** — ODM/commodity board only |
 
 ---
@@ -90,16 +92,16 @@ Commodity mini PC, rebranded enclosure optional later.
 | RAM | **16 GB** (8 GB absolute floor) | Headroom for OS + node + updates |
 | Storage | **256 GB NVMe** (512 GB preferred) | Avoid SD cards; endurance matters |
 | NIC | **1× GbE** minimum | 2.5GbE nice-to-have on Pro |
+| Wi‑Fi | **Yes on Mini v1** (802.11ac/ax module) | Ethernet still preferred for reliability; Wi‑Fi for apartment/no-spare-port setups |
 | Video | HDMI optional | Headless OK; HDMI helps support |
 | Power | USB-C or barrel, **≤20W idle goal** | Wall-wart included |
 | Ports | USB-A for recovery stick | Factory reset / reimage |
 | Thermals | Fanless or low-noise | Living-room acceptable |
 | RTC | Nice-to-have | Clock skew less painful |
 | TPM / secure boot | Optional v1 | Nice for measured boot later |
-| Wi‑Fi | Optional module | Ethernet-first SKU avoids Wi‑Fi support hell |
 | Enclosure | Stock ODM + sticker / simple sleeve | Custom plastic = phase 2 |
-| BOM cost target | **~$120–220** | Sell Mini ~2× BOM + support margin |
-| Retail target | **~$299** sweet spot | Compete on setup, not TFLOPS |
+| BOM cost target | **~$130–240** (Wi‑Fi in BOM) | Sell Mini ~2× BOM + support/packs margin |
+| Retail target | **$299** locked anchor | Compete on setup; expand via feature packs |
 
 ### BOM — Pond Pro (delta)
 
@@ -133,13 +135,16 @@ Commodity mini PC, rebranded enclosure optional later.
 2. Plug power.  
 3. Wait for ready (LED or ~60s).  
 4. Phone/laptop opens **`http://pond.local`** (mDNS) or printed setup IP on claim card.  
+   - If no Ethernet: join Pond setup Wi‑Fi / use onboard Wi‑Fi wizard (Mini includes Wi‑Fi).  
 5. **Claim wizard:**
    - Create owner passkey (WebAuthn) + printed recovery code  
-   - Name the Pond  
-   - Optional: enable Tailscale/Headscale / relay assist  
+   - Name the Pond (**Thunderducks Pond**)  
+   - Network: confirm Ethernet and/or Wi‑Fi credentials  
+   - Remote access: enable **tailnet** and/or **Thunderducks relay** (both supported; user can pick one or both)  
    - Create first room  
 6. **Pair clients:** QR → web/app joins as thin client to this node.  
-7. Invite others (link / QR). Done.
+7. Invite others (link / QR). Done.  
+8. Optional later: unlock **feature packs** (purchased add-ons) from admin UI.
 
 ### Day-2 ops
 
@@ -200,12 +205,30 @@ Exact port map follows packaging work (slice C).
 
 | Stream | Notes |
 |--------|--------|
-| **Hardware margin** | Mini/Pro units |
+| **Hardware margin** | Pond Mini @ **$299** anchor; Pro higher |
+| **Feature packs** | Purchasable add-ons after base unit (see below) |
 | **Support** | Optional email/Discord tier |
 | **Cloud Pond** | Later subscription |
-| **Software** | AGPL upstream — image scripts open; no fake open core theater |
+| **Software core** | AGPL upstream — base node/image scripts open; no fake open core theater |
 
-Compliance note: AGPL on network service implies source offer obligations for modified networked instances — document for Cloud Pond before offering it.
+### Feature packs (post-purchase; direction lock)
+
+Base **$299** Mini is fully useful (node + clients + E2EE rooms + DIY-equivalent core).
+Packs are **convenience / capacity / managed** layers — not paywalled encryption.
+
+| Pack (examples) | Intent |
+|-----------------|--------|
+| **Remote Ease** | Guided tailnet + relay premium UX / managed defaults |
+| **Family** | Multi-profile invites, parental/guest modes, extra device slots UX |
+| **Keeper** | Automated encrypted backup to user cloud/USB schedule |
+| **Pond Pro software** | Unlock Pro-oriented limits/features without new hardware |
+| **Priority support** | Human SLA |
+
+Exact pack catalog is **not** locked — only the model: **hardware anchor + optional packs**.
+
+**Rule:** E2EE, local-only operation, and AGPL core remain available without packs.
+
+Compliance note: AGPL on network service implies source offer obligations for modified networked instances — document for Cloud Pond before offering it. Pack implementation must not violate AGPL (prefer services, UX, hosting, and support over proprietary core forks).
 
 ---
 
@@ -239,7 +262,7 @@ Current repo: strong node MVP; **packaging + claim UX + remote path** are the ga
 
 | Risk | Mitigation |
 |------|------------|
-| Support burden (Wi‑Fi, CGNAT) | Ethernet-first; tailnet/relay default remote story |
+| Support burden (Wi‑Fi, CGNAT) | Ethernet preferred; Wi‑Fi included but well-tested wizard; **both** tailnet + relay for CGNAT |
 | Inventory | No custom plastic until 20–50 pilot units sell-through |
 | SD card death | NVMe only on retail |
 | User loses device | Recovery codes + encrypted backup |
@@ -264,13 +287,15 @@ Current repo: strong node MVP; **packaging + claim UX + remote path** are the ga
 
 ---
 
-## Open decisions (for Mike)
+## Decisions locked (Mike — 2026-08-01)
 
-1. Retail brand: **Thunderducks Pond** vs quieter brand (e.g. Everwood Pond)?  
-2. Remote default: **Tailscale-class** vs **first-party relay** vs both?  
-3. Wi‑Fi: skip on Mini v1 or include? (recommend **skip**)  
-4. Target retail price anchor: **$299** OK?  
-5. Pilot channel: friends / Discord / small store?
+| # | Decision | Lock |
+|---|----------|------|
+| 1 | Brand | **Thunderducks Pond** |
+| 2 | Remote access | **Both** — tailnet (Tailscale-class) **and** first-party relay |
+| 3 | Wi‑Fi on Mini v1 | **Yes** |
+| 4 | Price | **$299** Mini; then **purchasable feature packs** |
+| 5 | Pilot channel | **Open** — friends / Discord / small store TBD |
 
 ---
 
