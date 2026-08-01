@@ -20,9 +20,11 @@
    cd clients/widget-sdk && npm install && npm test
    cd ../bot && npm test
    ```
-5. Dev harness:
+5. Dev harness + P1 operator demos:
    ```bash
    ./scripts/dev-harness.sh
+   ./scripts/two-user-p2p.sh
+   ./scripts/relay-offline-catchup.sh
    ```
 6. Benches (release):
    ```bash

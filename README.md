@@ -38,8 +38,11 @@ docs/
   threat-model.md
   architecture.md
   bench.md
+  harness.md
 scripts/
   dev-harness.sh
+  two-user-p2p.sh
+  relay-offline-catchup.sh
 ```
 
 ## Dev harness
@@ -47,6 +50,9 @@ scripts/
 ```bash
 ./scripts/dev-harness.sh
 # optional relay: WITH_RELAY=1 ./scripts/dev-harness.sh
+# P1 operator demos only:
+./scripts/two-user-p2p.sh
+./scripts/relay-offline-catchup.sh
 ```
 
 ## Quick start
@@ -70,6 +76,7 @@ cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
 
 - [MVP accept checklist](./docs/mvp-accept.md)
 - [Post-MVP backlog](./docs/post-mvp-backlog.md)
+- [Operator harness](./docs/harness.md)
 - [Benches](./docs/bench.md)
 - [Threat model](./docs/threat-model.md)
 - [Architecture](./docs/architecture.md)

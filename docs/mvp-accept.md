@@ -1,16 +1,16 @@
 # MVP acceptance checklist (Gate 4)
 
-Recorded against `main` @ **97f98ae** (Waves A–F). Legend: ✅ met · ⚠️ partial/honest caveat · ❌ not met.
+Recorded against `main` (Waves A–F + P1.2/P1.3 harness). Legend: ✅ met · ⚠️ partial/honest caveat · ❌ not met.
 
 ## Functional
 
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | Public repo AGPL-3.0 | ✅ | `Everwood-Technologies/thunderducks`, `LICENSE` |
-| Two users E2EE 1:1 via direct P2P | ⚠️ | P2P framed path + Olm tests; operator multi-process 2-user demo still thin (P1.2) |
+| Two users E2EE 1:1 via direct P2P | ✅ | `scripts/two-user-p2p.sh` / example `two_user_p2p` + Olm unit tests |
 | Group E2EE ≥3 devices | ✅ | `td-crypto` Megolm 3-device fanout tests + e2ee bench |
 | One user 2 linked devices converge | ✅ | Wave D sync tests + CLI/link paths |
-| Relay assist ciphertext; P2P without relay | ⚠️ | Relay opaque envelope + unit tests; full offline→online script glue is P1.3 |
+| Relay assist ciphertext; P2P without relay | ✅ | `scripts/relay-offline-catchup.sh` + relay unit tests; sqlite plaintext-free check |
 | CLI + web enroll/link → room → send/recv | ✅ | `tducks smoke` / `happy-path`; `clients/web` npm smoke |
 | Demo widget + bot public API | ✅ | `widget-sdk` + `clients/bot`; CI `widgets` job |
 | Automated tests: DAG, crypto, membership, relay non-plaintext | ✅ | workspace `cargo test` + widget deny tests |
@@ -40,6 +40,6 @@ Recorded against `main` @ **97f98ae** (Waves A–F). Legend: ✅ met · ⚠️ p
 
 ## MVP claim
 
-**M5 vertical slice: ACCEPTED with caveats** (P2P multi-user operator script, relay coexistence script, WebAuthn stub, threat-model diff). Not production-ready.
+**M5 vertical slice: ACCEPTED with caveats** (WebAuthn still device-link stub; threat-model diff pass still open as P1.4). P1.2/P1.3 operator harness landed. Not production-ready.
 
-Next: `docs/post-mvp-backlog.md`.
+Next: `docs/post-mvp-backlog.md`, `docs/harness.md`.

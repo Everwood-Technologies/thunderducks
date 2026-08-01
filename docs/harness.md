@@ -1,0 +1,34 @@
+# Operator harness
+
+Runnable multi-process demos for MVP acceptance gaps P1.2 / P1.3.
+
+## Scripts
+
+| Script | What it proves |
+|--------|----------------|
+| `./scripts/two-user-p2p.sh` | **P1.2** — two distinct device identities exchange signed events over real localhost TCP P2P (no shared memory, no relay) |
+| `./scripts/relay-offline-catchup.sh` | **P1.3** — Bob offline → Alice puts **opaque** envelope on real `td-relay` → Bob fetch/open/ack → later **direct P2P** without relay; sqlite must not contain plaintext marker |
+| `./scripts/dev-harness.sh` | Full smoke (RPC + CLI + bot) and, by default, both P1 demos (`WITH_P1=0` to skip) |
+
+## Examples (Rust)
+
+```bash
+cargo run -p td-node --example two_user_p2p
+cargo build -p td-relay
+cargo run -p td-node --example relay_offline_catchup
+```
+
+## Env
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `WITH_P1` | `1` | Run P1.2/P1.3 inside `dev-harness.sh` |
+| `WITH_RELAY` | `0` | Also start a long-lived harness relay on `RELAY_BIND` |
+| `RPC_BIND` | `127.0.0.1:8788` | Node RPC |
+| `RELAY_BIND` | `127.0.0.1:7700` | Long-lived harness relay |
+| `TD_RELAY_BIN` | `target/debug/td-relay` | Override relay binary for P1.3 |
+
+## Notes
+
+- P2P path is length-prefixed framed events on TCP (`td://host:port`). QUIC later.
+- Relay outer layer is opaque ciphertext at rest; MVP seal is XOR-pad over signed-event JSON (same as unit tests) — not a claim of production E2EE-at-rest on the wire to the relay beyond “relay never sees room plaintext API”.

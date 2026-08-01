@@ -1,3 +1,9 @@
 # Dev harness
 
-Multi-peer local topology (2–3 nodes + optional relay). Filled in Wave F / U12.
+See [`docs/harness.md`](../../docs/harness.md) and:
+
+```bash
+./scripts/dev-harness.sh
+./scripts/two-user-p2p.sh          # P1.2
+./scripts/relay-offline-catchup.sh # P1.3
+```

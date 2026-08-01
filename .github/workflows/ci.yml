@@ -61,3 +61,17 @@ jobs:
       - name: bot test
         working-directory: clients/bot
         run: npm test
+
+  harness:
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build relay + P1 examples
+        run: cargo build -p td-relay -p td-node --examples
+      - name: P1.2 two-user P2P
+        run: ./target/debug/examples/two_user_p2p
+      - name: P1.3 relay offline catch-up
+        run: ./target/debug/examples/relay_offline_catchup

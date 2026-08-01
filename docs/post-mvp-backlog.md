@@ -17,8 +17,8 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | ID | Item | Why | Effort |
 |----|------|-----|--------|
 | P1.1 | **WebAuthn / passkeys** (replace device-link stub as primary UX) | Gate 3 identity lock; docs still say passkeys | M–L; keep device-link as recovery |
-| P1.2 | **True multi-user P2P demo script** (2 identities, direct path, no shared process) | Acceptance “two users E2EE via P2P” is covered in unit/integration more than operator script | S–M; extend harness |
-| P1.3 | **Relay + P2P coexistence script** (offline catch-up then direct) | Acceptance criterion; pieces exist, glue thin | S |
+| P1.2 | **True multi-user P2P demo script** | ✅ done — `scripts/two-user-p2p.sh` + `td-node` example `two_user_p2p` | done |
+| P1.3 | **Relay + P2P coexistence script** | ✅ done — `scripts/relay-offline-catchup.sh` + example `relay_offline_catchup` | done |
 | P1.4 | Threat-model ↔ impl **diff pass** | Security review bar | S; annotate any drift |
 
 ## P2 — docs / public face
@@ -45,11 +45,12 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 ## Suggested order
 
 1. P0.1 PAT rotate (human)  
-2. P0.2 SECURITY.md ← this PR  
-3. P1.4 + P1.2/P1.3 harness glue  
-4. P2.1 Pages when you want a public face  
-5. P1.1 WebAuthn when identity UX matters  
-6. P3.* as interest/funding allows  
+2. P0.2 SECURITY.md ✅  
+3. P1.2/P1.3 harness glue ✅  
+4. P1.4 threat-model ↔ impl diff  
+5. P2.1 Pages when you want a public face  
+6. P1.1 WebAuthn when identity UX matters  
+7. P3.* as interest/funding allows  
 
 ## Out of scope forever (unless new Gate)
 
