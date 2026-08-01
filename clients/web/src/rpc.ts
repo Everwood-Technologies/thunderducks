@@ -552,7 +552,7 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
       <input id="msg" placeholder="message" />
       <button id="send">Send</button>
     </div>
-    <p style="font-size:0.85rem;color:#666">Peers (RPC): <input id="peers" style="min-width:22rem" placeholder="http://127.0.0.1:8789,http://127.0.0.1:8790" /></p>
+    <p style="font-size:0.85rem;color:#666">Peers (RPC, optional multi-node): <input id="peers" style="min-width:22rem" placeholder="empty = single-node; or http://other:8788" /></p>
     <pre id="log"></pre>
   `;
   (root.querySelector("#rpcurl") as HTMLElement).textContent = client.baseUrl;
@@ -560,16 +560,10 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
   const peersInput = root.querySelector("#peers") as HTMLInputElement;
   const liveEl = root.querySelector("#live") as HTMLElement;
   if (presetRoom) roomInput.value = presetRoom;
+  // Single-node / Pond appliance: no default peers.
+  // Multi-node demos: pass ?peers=http://host:8789,http://host:8790
   if (peerParam) peersInput.value = peerParam;
-  else {
-    const u = client.baseUrl.replace(/\/$/, "");
-    const defaults = [
-      "http://127.0.0.1:8788",
-      "http://127.0.0.1:8789",
-      "http://127.0.0.1:8790",
-    ].filter((p) => p !== u);
-    peersInput.value = defaults.join(",");
-  }
+  else peersInput.value = "";
   const log = (s: string) => {
     const el = root.querySelector("#log") as HTMLPreElement;
     el.textContent = `${s}\n${el.textContent ?? ""}`;
@@ -607,11 +601,15 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
   };
 
   const ensurePeers = async () => {
+    const self = client.baseUrl.replace(/\/$/, "");
     let i = 0;
     for (const peer of peerList()) {
+      const p = peer.replace(/\/$/, "");
+      // Never register self as a fanout target.
+      if (!p || p === self) continue;
       i += 1;
       try {
-        await client.addPeer(`peer${i}`, peer, { rpc: peer });
+        await client.addPeer(`peer${i}`, p, { rpc: p });
       } catch {
         /* already added */
       }
@@ -840,8 +838,14 @@ export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
       const s = await client.send(roomId, text);
       const fo = s.fanout_ok ?? 0;
       const fp = s.fanout_peers ?? 0;
-      log(`sent ${s.event_id.slice(0, 12)}… fanout ${fo}/${fp}`);
-      if (s.fanout_errors?.length) log(`fanout errs: ${s.fanout_errors.join("; ")}`);
+      if (fp === 0) {
+        log(`sent ${s.event_id.slice(0, 12)}… (local only; no peers)`);
+      } else {
+        log(`sent ${s.event_id.slice(0, 12)}… fanout ${fo}/${fp}`);
+        if (s.fanout_errors?.length) {
+          log(`fanout errs: ${s.fanout_errors.join("; ")}`);
+        }
+      }
       const msgs = await client.listMessages(roomId);
       renderMessages(msgs.messages);
       if (liveEnabled) startLive();
