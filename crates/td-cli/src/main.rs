@@ -19,6 +19,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Print version
     Version,
@@ -58,6 +59,18 @@ enum Commands {
         /// Ephemeral self-signed TLS (dev only).
         #[arg(long, env = "TD_TLS_SELF_SIGNED", default_value_t = false)]
         tls_self_signed: bool,
+        /// QUIC identity cert PEM (default: $TD_DATA_DIR/quic-cert.pem when p2p-quic).
+        #[arg(long, env = "TD_QUIC_CERT")]
+        quic_cert: Option<std::path::PathBuf>,
+        /// QUIC identity key PEM (default: $TD_DATA_DIR/quic-key.pem when p2p-quic).
+        #[arg(long, env = "TD_QUIC_KEY")]
+        quic_key: Option<std::path::PathBuf>,
+        /// Comma/space-separated blake3 leaf-cert pins (64 hex) for QUIC peers.
+        #[arg(long, env = "TD_QUIC_PINS")]
+        quic_pins: Option<String>,
+        /// Require client certs on QUIC accept (mTLS). Default: on when pins set.
+        #[arg(long, env = "TD_QUIC_MTLS")]
+        quic_mtls: Option<bool>,
         /// Require owner session for non-public routes when bind is non-loopback (default true).
         #[arg(long, env = "TD_REQUIRE_OWNER", default_value_t = true)]
         require_owner: bool,
@@ -118,6 +131,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             tls_cert,
             tls_key,
             tls_self_signed,
+            quic_cert,
+            quic_key,
+            quic_pins,
+            quic_mtls,
             require_owner,
             rate_limit,
         } => {
@@ -148,6 +165,18 @@ async fn run(cli: Cli) -> Result<(), String> {
                 opts.tls_key = tls_key;
             }
             opts.tls_self_signed = tls_self_signed;
+            if quic_cert.is_some() {
+                opts.quic_cert = quic_cert;
+            }
+            if quic_key.is_some() {
+                opts.quic_key = quic_key;
+            }
+            if quic_pins.is_some() {
+                opts.quic_pins = quic_pins;
+            }
+            if quic_mtls.is_some() {
+                opts.quic_mtls = quic_mtls;
+            }
             opts.require_owner_non_loopback = require_owner;
             opts.rate_limit = rate_limit;
             td_node::serve_blocking_with_options(&bind, opts)

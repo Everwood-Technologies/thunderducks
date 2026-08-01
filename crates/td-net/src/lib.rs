@@ -3,7 +3,7 @@
 //! Transport:
 //! - plain TCP length-prefixed JSON (`td://`) — default localhost/DIY
 //! - **Noise_XX** over TCP (`td-noise://`)
-//! - **QUIC** (`td-quic://`) first slice with self-signed TLS
+//! - **QUIC** (`td-quic://`) with optional blake3 cert pins + mTLS
 
 mod frame;
 mod noise;
@@ -19,7 +19,9 @@ pub use noise::{
 };
 pub use peer::{accept_once, dial, serve_exchange, PeerError, PeerUri};
 pub use quic::{
-    is_quic_uri, quic_accept, quic_dial, quic_listen, QuicError, QuicStream,
+    cert_pin_blake3, cert_pin_hex, is_quic_uri, load_pem_identity, parse_pin_list, quic_accept,
+    quic_dial, quic_dial_with_config, quic_listen, quic_listen_with_config, self_signed_cert,
+    write_self_signed_pem, QuicError, QuicStream, QuicTlsConfig,
 };
 pub use relay_client::{RelayClient, RelayClientError};
 pub use relay_proto::{

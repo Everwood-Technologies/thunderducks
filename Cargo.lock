@@ -2299,6 +2299,7 @@ dependencies = [
  "rand 0.8.7",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "snow",

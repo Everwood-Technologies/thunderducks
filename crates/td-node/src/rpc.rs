@@ -28,8 +28,9 @@ use td_event::{
     sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
 use td_net::{
-    accept_once, dial, noise_read_event, quic_accept, quic_listen, read_event, write_event,
-    NoiseTcpStream, PeerUri, RelayClient, RelayEnvelope,
+    accept_once, dial, noise_read_event, parse_pin_list, quic_accept, quic_dial_with_config,
+    quic_listen_with_config, read_event, write_event, write_self_signed_pem, NoiseTcpStream,
+    PeerUri, QuicTlsConfig, RelayClient, RelayEnvelope,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::net::TcpListener;
@@ -66,6 +67,14 @@ pub struct ServeOptions {
     pub tls_key: Option<PathBuf>,
     /// Generate ephemeral self-signed cert when no cert/key (dev only).
     pub tls_self_signed: bool,
+    /// QUIC identity cert PEM (`TD_QUIC_CERT`). Falls back to data-dir generated cert.
+    pub quic_cert: Option<PathBuf>,
+    /// QUIC identity key PEM (`TD_QUIC_KEY`).
+    pub quic_key: Option<PathBuf>,
+    /// Comma/space-separated blake3 leaf-cert pins (64 hex) for QUIC peers (`TD_QUIC_PINS`).
+    pub quic_pins: Option<String>,
+    /// Require client certs on QUIC accept (mTLS). Default true when pins set.
+    pub quic_mtls: Option<bool>,
 }
 
 impl ServeOptions {
@@ -121,6 +130,16 @@ impl ServeOptions {
                 !(v == "0" || v == "false" || v == "off" || v == "no")
             })
             .unwrap_or(false);
+        let quic_cert = std::env::var_os("TD_QUIC_CERT").map(PathBuf::from);
+        let quic_key = std::env::var_os("TD_QUIC_KEY").map(PathBuf::from);
+        let quic_pins = std::env::var("TD_QUIC_PINS")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let quic_mtls = std::env::var("TD_QUIC_MTLS").ok().map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        });
         Self {
             data_dir,
             p2p_bind,
@@ -134,6 +153,10 @@ impl ServeOptions {
             tls_cert,
             tls_key,
             tls_self_signed,
+            quic_cert,
+            quic_key,
+            quic_pins,
+            quic_mtls,
         }
     }
 }
@@ -153,6 +176,10 @@ impl Default for ServeOptions {
             tls_cert: None,
             tls_key: None,
             tls_self_signed: false,
+            quic_cert: None,
+            quic_key: None,
+            quic_pins: None,
+            quic_mtls: None,
         }
     }
 }
@@ -414,6 +441,10 @@ struct NodeSession {
     p2p_noise: bool,
     /// Prefer QUIC for P2P.
     p2p_quic: bool,
+    /// QUIC TLS policy (identity + pins + mTLS).
+    quic_tls: Option<QuicTlsConfig>,
+    /// Local QUIC leaf pin (hex) when available.
+    quic_pin: Option<String>,
     /// RPC served over HTTPS.
     rpc_tls: bool,
     /// Last relay poll summary (best-effort).
@@ -460,6 +491,8 @@ impl NodeSession {
             relay_key: td_crypto::derive_relay_key(td_crypto::DEFAULT_RELAY_KEY_MATERIAL),
             p2p_noise: false,
             p2p_quic: false,
+            quic_tls: None,
+            quic_pin: None,
             rpc_tls: false,
             relay_last_fetch_ms: None,
             relay_last_error: None,
@@ -477,6 +510,7 @@ impl NodeSession {
         self.relay_key = opts.relay_key;
         self.p2p_noise = opts.p2p_noise;
         self.p2p_quic = opts.p2p_quic;
+        // quic_tls filled in prepare_serve after data_dir known
     }
 
     fn load_from_data_dir(dir: NodeDataDir) -> Result<Self, String> {
@@ -1817,12 +1851,23 @@ async fn send_message(
     }
 
     // Best-effort P2P: push only the new event (not full DAG every send).
+    let quic_tls = {
+        let g = st.inner.lock().await;
+        g.quic_tls.clone()
+    };
     for ep in peers_snapshot {
         if let Some(uri) = ep.p2p {
             if let Ok(peer) = PeerUri::parse(&uri) {
                 let ev = new_event.clone();
+                let qtls = quic_tls.clone();
                 tokio::spawn(async move {
-                    if let Ok(mut sock) = dial(&peer).await {
+                    if peer.quic {
+                        if let Some(cfg) = qtls {
+                            if let Ok(mut stream) = quic_dial_with_config(&peer, &cfg).await {
+                                let _ = stream.write_event(&ev).await;
+                            }
+                        }
+                    } else if let Ok(mut sock) = dial(&peer).await {
                         let _ = write_event(&mut sock, &ev).await;
                     }
                 });
@@ -2815,6 +2860,9 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
         "rate_limit": st.rate_limit_enabled,
         "p2p_noise": g.p2p_noise,
         "p2p_quic": g.p2p_quic,
+        "quic_pin": g.quic_pin,
+        "quic_mtls": g.quic_tls.as_ref().map(|c| c.require_client_auth).unwrap_or(false),
+        "quic_pins": g.quic_tls.as_ref().map(|c| c.peer_pins.len()).unwrap_or(0),
         "rpc_tls": g.rpc_tls,
         "relay_seal": "olm-v2+aead-v1",
         "peers": g.peers.values().collect::<Vec<_>>(),
@@ -3749,7 +3797,13 @@ async fn start_p2p_listener(
     };
 
     if quic {
-        let (endpoint, addr) = quic_listen(p2p_bind)
+        let qcfg = {
+            let g = state.inner.lock().await;
+            g.quic_tls
+                .clone()
+                .unwrap_or_else(|| QuicTlsConfig::insecure_ephemeral().expect("ephemeral quic"))
+        };
+        let (endpoint, addr) = quic_listen_with_config(p2p_bind, &qcfg)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let uri = advertise_p2p_uri(addr, advertise_host, false, true);
@@ -3960,6 +4014,53 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
 }
 
 
+
+fn build_quic_tls_config(opts: &ServeOptions, data_dir: Option<&PathBuf>) -> Result<Option<QuicTlsConfig>, String> {
+    if !opts.p2p_quic {
+        return Ok(None);
+    }
+    let pins = match &opts.quic_pins {
+        Some(s) => parse_pin_list(s).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let mtls = opts.quic_mtls.unwrap_or(!pins.is_empty());
+
+    let (cert, key) = match (&opts.quic_cert, &opts.quic_key) {
+        (Some(c), Some(k)) => (c.clone(), k.clone()),
+        (None, None) => {
+            // Prefer durable identity under data dir; else ephemeral.
+            if let Some(dir) = data_dir {
+                let c = dir.join("quic-cert.pem");
+                let k = dir.join("quic-key.pem");
+                if c.is_file() && k.is_file() {
+                    (c, k)
+                } else {
+                    let mut cfg = write_self_signed_pem(&c, &k).map_err(|e| e.to_string())?;
+                    cfg = cfg.with_pins(pins).with_mtls(mtls);
+                    return Ok(Some(cfg));
+                }
+            } else {
+                let mut cfg = QuicTlsConfig::insecure_ephemeral().map_err(|e| e.to_string())?;
+                if !pins.is_empty() {
+                    cfg = cfg.with_pins(pins).with_mtls(mtls);
+                }
+                return Ok(Some(cfg));
+            }
+        }
+        _ => {
+            return Err("both TD_QUIC_CERT and TD_QUIC_KEY required (or neither)".into());
+        }
+    };
+
+    let mut cfg =
+        QuicTlsConfig::from_pem_files(&cert, &key, pins, mtls).map_err(|e| e.to_string())?;
+    // from_pem_files sets insecure when no pins; honor explicit mtls/pins
+    if mtls {
+        cfg = cfg.with_mtls(true);
+    }
+    Ok(Some(cfg))
+}
+
 fn ensure_rustls_provider() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -4162,13 +4263,19 @@ async fn prepare_serve(bind: &str, opts: ServeOptions) -> Result<PreparedServe, 
     let tls_cert = opts.tls_cert.clone();
     let tls_key = opts.tls_key.clone();
     let tls_self_signed = opts.tls_self_signed;
-    let mut state = new_state_with_options(opts).map_err(std::io::Error::other)?;
+    let mut state = new_state_with_options(opts.clone()).map_err(std::io::Error::other)?;
     state.require_owner = require_owner;
     let tls = load_tls_config(tls_cert.as_ref(), tls_key.as_ref(), tls_self_signed).await?;
     let https = tls.is_some();
     {
         let mut g = state.inner.lock().await;
         g.rpc_tls = https;
+        let data_root = g.data_dir.as_ref().map(|d| d.root().to_path_buf());
+        let qcfg = build_quic_tls_config(&opts, data_root.as_ref()).map_err(std::io::Error::other)?;
+        if let Some(ref c) = qcfg {
+            g.quic_pin = c.local_pin_hex();
+        }
+        g.quic_tls = qcfg;
     }
     let p2p = start_p2p_listener(state.clone(), &p2p_bind, advertise.as_deref()).await?;
     spawn_relay_poller(state.clone());

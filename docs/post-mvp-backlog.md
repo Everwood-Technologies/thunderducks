@@ -38,6 +38,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.1c | **Production relay seal** (ChaCha20-Poly1305 / `TD_RELAY_KEY`) | ✅ done |
 | P3.1d | **Per-recipient Olm relay wrap** (v2; AEAD v1 fallback) | ✅ done |
 | P3.1e | **In-process HTTPS RPC** (`TD_TLS_CERT`/`KEY` / self-signed) | ✅ done |
+| P3.1f | **QUIC mTLS + cert pin** (`TD_QUIC_PINS` / `TD_QUIC_MTLS`) | ✅ done |
 | P3.2 | **SSE live message push** (`GET /v1/messages/stream`; WS later) | ✅ done (A2) |
 | P3.2b | **Shared room Megolm ownership** (one outbound session/room) | ✅ done (B2) |
 | P3.2c | **Pond packaging** (linux amd64/arm64 release + systemd DIY install) | ✅ done (C) |

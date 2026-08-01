@@ -31,6 +31,10 @@ Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner
 | `TD_RELAY_KEY` / `--relay-key` | Fallback shared AEAD key (v1) when Olm session missing; UTF-8 or 64-hex → blake3 |
 | `TD_P2P_NOISE` / `--p2p-noise` | Advertise `td-noise://` + Noise_XX on P2P accept (default **false**) |
 | `TD_P2P_QUIC` / `--p2p-quic` | Advertise `td-quic://` + QUIC accept (default **false**; takes precedence over noise) |
+| `TD_QUIC_CERT` / `--quic-cert` | QUIC identity cert PEM (default `$TD_DATA_DIR/quic-cert.pem`, auto-generated) |
+| `TD_QUIC_KEY` / `--quic-key` | QUIC identity key PEM (default `$TD_DATA_DIR/quic-key.pem`) |
+| `TD_QUIC_PINS` / `--quic-pins` | Comma/space-separated **blake3 leaf-cert pins** (64 hex) for production peers |
+| `TD_QUIC_MTLS` / `--quic-mtls` | Require client certs on accept (default **on when pins set**) |
 | `TD_TLS_CERT` / `--tls-cert` | PEM cert for **in-process HTTPS** RPC |
 | `TD_TLS_KEY` / `--tls-key` | PEM private key for HTTPS RPC |
 | `TD_TLS_SELF_SIGNED` / `--tls-self-signed` | Ephemeral self-signed HTTPS (dev only; default **false**) |
@@ -45,6 +49,7 @@ export TD_P2P_BIND=0.0.0.0:0
 export TD_RELAY_URI=td://relay.example:7700
 export TD_RELAY_KEY='long-random-shared-secret'
 # optional: TD_P2P_NOISE=true  or  TD_P2P_QUIC=true
+# production QUIC: TD_QUIC_PINS=<blake3-hex-of-peer-leaf-der>  (enables mTLS by default)
 # optional HTTPS: TD_TLS_CERT=/etc/ssl/pond.crt TD_TLS_KEY=/etc/ssl/pond.key
 # dev only: TD_TLS_SELF_SIGNED=true
 tducks serve --bind 127.0.0.1:8788 --data-dir "$TD_DATA_DIR"
@@ -118,7 +123,8 @@ export TD_RELAY_URI=td://relay.example.com:7700
 Honest limits:
 
 - Relay never sees room plaintext API. Preferred device-side seal is **Olm per-recipient (v2)** after `POST /v1/e2ee/trust-keys` (or share-session which caches keys). Shared-key AEAD (`TD_RELAY_KEY`, v1) is fallback only when no Olm session exists.
-- Noise_XX and QUIC available for P2P; HTTPS RPC in-process (or still terminate-at-proxy / Tailscale serve).
+- Noise_XX and QUIC available for P2P; QUIC production peers use blake3 cert pins + optional mTLS (`TD_QUIC_PINS` / `TD_QUIC_MTLS`).
+- HTTPS RPC in-process (or still terminate-at-proxy / Tailscale serve).
 - Pair links still embed RPC base; use advertise host + recovery unlock on the client.
 - OTA / Wi‑Fi: see [`ota-wifi.md`](./ota-wifi.md).
 
