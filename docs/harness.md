@@ -54,6 +54,6 @@ New RPC used by the demo:
 
 - P2P path is length-prefixed framed events on TCP (`td://host:port`). QUIC later.
 - Relay outer layer is opaque ciphertext at rest; MVP seal is XOR-pad over signed-event JSON (same as unit tests) — not a claim of production E2EE-at-rest on the wire to the relay beyond “relay never sees room plaintext API”.
-- Multi-node Megolm key share over plain HTTP is **localhost-demo only** (not production key distribution).
+- Megolm room keys are **Olm-wrapped** on fanout/share (`GET /v1/e2ee/olm-keys`, `POST /v1/e2ee/import-olm`, `POST /v1/e2ee/share-session` path=olm). Plaintext `import-session` remains as a legacy/compat path only.
 - **send-just-works (P0):** `POST /v1/messages` auto-shares the sender Megolm session and delta-ingests to every peer with an HTTP `rpc` endpoint (`fanout_ok` / `fanout_peers` in the response). Register peers with `rpc` (not only `td://` P2P) for reliable multi-node decrypt.
 - **live long-poll (P3.2-lite):** `POST /v1/messages/wait` with `{ room_id, since_count, timeout_ms }` blocks until message count changes (or timeout). Web UI enables live mode by default (`?live=0` to disable); it also best-effort `sync/peer` between waits so fan-in from other nodes appears without Refresh.

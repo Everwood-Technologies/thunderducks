@@ -64,6 +64,18 @@ mod tests {
     }
 
     #[test]
+    fn publish_keys_twice_yields_otks() {
+        let kp = DeviceKeypair::generate();
+        let mut dev = E2eeDevice::new(kp.device_id());
+        let k1 = dev.publish_keys().unwrap();
+        let k2 = dev.publish_keys().unwrap();
+        assert!(!k1.one_time_key_b64.is_empty());
+        assert!(!k2.one_time_key_b64.is_empty());
+        // second publish must not fail (regression: mark_keys_as_published emptied unpublished map)
+        assert_ne!(k1.one_time_key_b64, k2.one_time_key_b64);
+    }
+
+    #[test]
     fn olm_1to1_roundtrip() {
         let a_kp = DeviceKeypair::generate();
         let b_kp = DeviceKeypair::generate();

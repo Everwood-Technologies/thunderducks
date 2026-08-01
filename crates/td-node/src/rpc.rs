@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use td_crypto::{DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, PasskeyRegistry};
+use td_crypto::{
+    DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
+    PasskeyRegistry,
+};
 use td_event::{
     sign_event, DeviceId, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
@@ -496,24 +499,18 @@ async fn send_message(
             };
             let peer_base = rpc.trim_end_matches('/').to_string();
 
-            // 1) share current outbound Megolm key so peer can decrypt our sends
-            if let Some(ref key) = session_key_b64 {
-                match client
-                    .post(format!("{peer_base}/v1/e2ee/import-session"))
-                    .json(&serde_json::json!({ "session_key_b64": key }))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        fanout_errors.push(format!("{}: import HTTP {}", ep.name, r.status()));
-                        continue;
-                    }
-                    Err(e) => {
-                        fanout_errors.push(format!("{}: import {e}", ep.name));
-                        continue;
-                    }
-                }
+            // 1) Olm-wrap + deliver pre-encrypt Megolm key (must not re-export after ratchet)
+            if let Err(e) = share_megolm_olm_to_peer(
+                &st,
+                &peer_base,
+                &room_hex,
+                &client,
+                session_key_b64.as_deref(),
+            )
+            .await
+            {
+                fanout_errors.push(format!("{}: olm-share {e}", ep.name));
+                continue;
             }
 
             // 2) delta: try new event only; if peer missing parents, push full DAG once
@@ -882,7 +879,23 @@ pub struct SessionKeyRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SessionImportRequest {
-    pub session_key_b64: String,
+    /// Legacy plaintext path (kept for smoke/compat). Prefer Olm-wrapped import.
+    #[serde(default)]
+    pub session_key_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OlmWrappedImportRequest {
+    /// Sender curve25519 identity (base64) for Olm inbound establish.
+    pub sender_curve25519_b64: String,
+    pub olm: OlmCiphertext,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OlmKeysHttp {
+    pub device_id: String,
+    pub curve25519_b64: String,
+    pub one_time_key_b64: String,
 }
 
 async fn sync_offer(
@@ -1071,15 +1084,57 @@ async fn export_session(
     }
 }
 
+fn parse_crypto_device_id(s: &str) -> Result<td_crypto::DeviceId, String> {
+    let b = hex::decode(s).map_err(|e| e.to_string())?;
+    if b.len() != 32 {
+        return Err("device_id must be 32 bytes hex".into());
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    Ok(td_crypto::DeviceId(a))
+}
+
+async fn olm_keys_get(State(st): State<RpcState>) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    match g.e2ee.publish_keys() {
+        Ok(k) => Json(OlmKeysHttp {
+            device_id: hex32(&k.device_id.0),
+            curve25519_b64: k.curve25519_b64,
+            one_time_key_b64: k.one_time_key_b64,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn import_session(
     State(st): State<RpcState>,
     Json(req): Json<SessionImportRequest>,
 ) -> impl IntoResponse {
+    let Some(key) = req.session_key_b64.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "session_key_b64 required for plaintext import; use /v1/e2ee/import-olm"
+                    .into(),
+            }),
+        )
+            .into_response();
+    };
     let mut g = st.inner.lock().await;
-    match g.e2ee.import_group_session_key(&req.session_key_b64) {
-        Ok(session_id) => {
-            Json(serde_json::json!({ "ok": true, "session_id": session_id })).into_response()
-        }
+    match g.e2ee.import_group_session_key(key) {
+        Ok(session_id) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "path": "plaintext",
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
@@ -1090,33 +1145,124 @@ async fn import_session(
     }
 }
 
-async fn share_session_with_peer(
+async fn import_session_olm(
     State(st): State<RpcState>,
-    Json(req): Json<SyncPeerRequest>,
+    Json(req): Json<OlmWrappedImportRequest>,
 ) -> impl IntoResponse {
-    // Export our megolm key for room and POST import to peer (localhost demo path).
-    let room_hex = req.room_id.clone();
-    let peer_base = req.peer_rpc.trim_end_matches('/').to_string();
-    let (session_key_b64, session_id, sender) = {
-        let mut g = st.inner.lock().await;
-        g.ensure_room_e2ee(&room_hex);
-        match g.e2ee.export_group_session_key(&room_hex) {
-            Ok(k) => (
-                k,
-                g.e2ee.group_session_id(&room_hex).unwrap_or_default(),
-                hex32(&g.keypair.device_id().0),
-            ),
-            Err(e) => {
-                return (
+    let mut g = st.inner.lock().await;
+    match g.e2ee.olm_decrypt(&req.sender_curve25519_b64, &req.olm) {
+        Ok(plain) => {
+            let key = match std::str::from_utf8(&plain) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorBody {
+                            error: format!("olm plaintext utf8: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            match g.e2ee.import_group_session_key(&key) {
+                Ok(session_id) => Json(serde_json::json!({
+                    "ok": true,
+                    "session_id": session_id,
+                    "path": "olm",
+                }))
+                .into_response(),
+                Err(e) => (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorBody {
                         error: e.to_string(),
                     }),
                 )
-                    .into_response();
+                    .into_response(),
             }
         }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: format!("olm decrypt: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Establish Olm to peer (fetch their keys) and POST Olm-wrapped Megolm session key.
+/// If `pre_exported_key` is set (send path), use it — do not re-export after encrypt.
+async fn share_megolm_olm_to_peer(
+    st: &RpcState,
+    peer_base: &str,
+    room_hex: &str,
+    client: &reqwest::Client,
+    pre_exported_key: Option<&str>,
+) -> Result<(String, String), String> {
+    let peer_base = peer_base.trim_end_matches('/');
+    let keys_http: OlmKeysHttp = client
+        .get(format!("{peer_base}/v1/e2ee/olm-keys"))
+        .send()
+        .await
+        .map_err(|e| format!("olm-keys: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("olm-keys HTTP: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("olm-keys decode: {e}"))?;
+
+    let peer_dev = parse_crypto_device_id(&keys_http.device_id)?;
+    let their = OlmDeviceKeys {
+        device_id: peer_dev,
+        curve25519_b64: keys_http.curve25519_b64.clone(),
+        one_time_key_b64: keys_http.one_time_key_b64.clone(),
     };
+
+    let (olm_ct, sender_curve, session_id, sender_dev) = {
+        let mut g = st.inner.lock().await;
+        g.ensure_room_e2ee(room_hex);
+        g.e2ee
+            .establish_olm_outbound(&their)
+            .map_err(|e| e.to_string())?;
+        let key = if let Some(k) = pre_exported_key {
+            k.to_string()
+        } else {
+            g.e2ee
+                .export_group_session_key(room_hex)
+                .map_err(|e| e.to_string())?
+        };
+        let ct = g
+            .e2ee
+            .olm_encrypt(peer_dev, key.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let sid = g.e2ee.group_session_id(room_hex).unwrap_or_default();
+        let curve = g.e2ee.curve25519_b64();
+        let sender = hex32(&g.keypair.device_id().0);
+        (ct, curve, sid, sender)
+    };
+
+    let resp = client
+        .post(format!("{peer_base}/v1/e2ee/import-olm"))
+        .json(&serde_json::json!({
+            "sender_curve25519_b64": sender_curve,
+            "olm": olm_ct,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("import-olm: {e}"))?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("import-olm failed: {body}"));
+    }
+    Ok((session_id, sender_dev))
+}
+
+async fn share_session_with_peer(
+    State(st): State<RpcState>,
+    Json(req): Json<SyncPeerRequest>,
+) -> impl IntoResponse {
+    let room_hex = req.room_id.clone();
+    let peer_base = req.peer_rpc.trim_end_matches('/').to_string();
     let client = match reqwest_client() {
         Ok(c) => c,
         Err(e) => {
@@ -1127,34 +1273,17 @@ async fn share_session_with_peer(
                 .into_response();
         }
     };
-    match client
-        .post(format!("{peer_base}/v1/e2ee/import-session"))
-        .json(&serde_json::json!({ "session_key_b64": session_key_b64 }))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => Json(serde_json::json!({
+    match share_megolm_olm_to_peer(&st, &peer_base, &room_hex, &client, None).await {
+        Ok((session_id, sender)) => Json(serde_json::json!({
             "ok": true,
             "session_id": session_id,
             "sender_device": sender,
             "peer_rpc": peer_base,
             "room_id": room_hex,
+            "path": "olm",
         }))
         .into_response(),
-        Ok(r) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorBody {
-                error: format!("peer import HTTP {}", r.status()),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorBody {
-                error: format!("peer import: {e}"),
-            }),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorBody { error: e })).into_response(),
     }
 }
 
@@ -1205,8 +1334,10 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/sync/offer", post(sync_offer))
         .route("/v1/sync/ingest", post(sync_ingest))
         .route("/v1/sync/peer", post(sync_peer))
+        .route("/v1/e2ee/olm-keys", get(olm_keys_get))
         .route("/v1/e2ee/export-session", post(export_session))
         .route("/v1/e2ee/import-session", post(import_session))
+        .route("/v1/e2ee/import-olm", post(import_session_olm))
         .route("/v1/e2ee/share-session", post(share_session_with_peer))
         .route("/v1/p2p", get(p2p_status))
         .layer(cors)

@@ -90,7 +90,10 @@ impl E2eeDevice {
     }
 
     pub fn publish_keys(&mut self) -> Result<OlmDeviceKeys, E2eeError> {
-        if self.account.stored_one_time_key_count() == 0 {
+        // one_time_keys() only returns *unpublished* OTKs. After mark_keys_as_published()
+        // that map is empty even if stored_one_time_key_count() > 0 — always generate
+        // when there is nothing left to hand out.
+        if self.account.one_time_keys().is_empty() {
             self.account.generate_one_time_keys(10);
         }
         let otk = *self
@@ -112,8 +115,16 @@ impl E2eeDevice {
         Curve25519PublicKey::from_base64(b64).map_err(|_| E2eeError::InvalidKey)
     }
 
+    pub fn has_olm_session(&self, peer: DeviceId) -> bool {
+        self.olm_sessions.contains_key(&peer)
+    }
+
     /// Alice establishes outbound Olm to Bob using Bob's published keys.
+    /// No-op if a session with this peer already exists.
     pub fn establish_olm_outbound(&mut self, their: &OlmDeviceKeys) -> Result<(), E2eeError> {
+        if self.olm_sessions.contains_key(&their.device_id) {
+            return Ok(());
+        }
         let id_key = Self::parse_curve(&their.curve25519_b64)?;
         let otk = Self::parse_curve(&their.one_time_key_b64)?;
         let session = self
