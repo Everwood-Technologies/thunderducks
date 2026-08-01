@@ -552,11 +552,12 @@ mod tests {
                 .unwrap();
             assert!(peer_ok.status().is_success());
 
-            // Non-loopback bind: owner gate on for admin mutations.
+            // Non-loopback bind: full owner gate on non-public routes.
             let opts2 = ServeOptions {
                 advertise_host: Some("100.64.0.2".into()),
                 p2p_bind: Some("127.0.0.1:0".into()),
                 require_owner_non_loopback: true,
+                rate_limit: true,
                 ..Default::default()
             };
             let addr2 = serve_with_options("0.0.0.0:0", opts2)
@@ -573,6 +574,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(st2["require_owner"], true);
+            assert_eq!(st2["rate_limit"], true);
             assert_eq!(st2["advertise_host"], "100.64.0.2");
 
             let denied = client
@@ -583,7 +585,16 @@ mod tests {
                 .unwrap();
             assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-            // Claim mints owner token → admin works.
+            // Chat paths also gated when require_owner is on.
+            let chat_denied = client
+                .post(format!("{base2}/v1/rooms"))
+                .json(&serde_json::json!({"name": "nope"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(chat_denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            // Claim mints owner token → admin + chat works.
             let claim: serde_json::Value = client
                 .post(format!("{base2}/v1/claim"))
                 .json(&serde_json::json!({"display_name": "Remote Pond"}))
@@ -603,6 +614,18 @@ mod tests {
                 .unwrap();
             assert!(allowed.status().is_success());
 
+            let room: serde_json::Value = client
+                .post(format!("{base2}/v1/rooms"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .json(&serde_json::json!({"name": "pond"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(room["room_id"].as_str().unwrap().len() == 64);
+
             let remote: serde_json::Value = client
                 .get(format!("{base2}/v1/remote"))
                 .send()
@@ -613,6 +636,89 @@ mod tests {
                 .unwrap();
             assert_eq!(remote["require_owner"], true);
             assert_eq!(remote["advertise_host"], "100.64.0.2");
+        });
+    }
+
+    #[test]
+    fn rate_limit_blocks_tight_bucket() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let opts = ServeOptions {
+                rate_limit: true,
+                ..Default::default()
+            };
+            let addr = serve_with_options("127.0.0.1:0", opts)
+                .await
+                .expect("bind");
+            let base = format!("http://{addr}");
+
+            // Claim once, then spam POST /v1/claim (tight 10/min bucket).
+            // Already-claimed returns 409 until the middleware rate limit trips (avoids
+            // conflating with recovery-login failure lockout).
+            let claim: serde_json::Value = client
+                .post(format!("{base}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Rate Pond"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(claim["ok"], true);
+
+            let mut saw_429 = false;
+            for _ in 0..20 {
+                let r = client
+                    .post(format!("{base}/v1/claim"))
+                    .json(&serde_json::json!({"display_name": "Rate Pond"}))
+                    .send()
+                    .await
+                    .unwrap();
+                if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    saw_429 = true;
+                    assert!(
+                        r.headers().get("retry-after").is_some(),
+                        "rate-limit 429 should include Retry-After"
+                    );
+                    break;
+                }
+                // 409 conflict while still under the window is expected
+                assert!(
+                    r.status() == reqwest::StatusCode::CONFLICT
+                        || r.status().is_success(),
+                    "unexpected status {}",
+                    r.status()
+                );
+            }
+            assert!(saw_429, "expected 429 after exceeding claim rate limit");
+
+            // Disable rate limit → no 429 on status spam (sanity for flag).
+            let opts2 = ServeOptions {
+                rate_limit: false,
+                ..Default::default()
+            };
+            let addr2 = serve_with_options("127.0.0.1:0", opts2)
+                .await
+                .expect("bind2");
+            let base2 = format!("http://{addr2}");
+            let st: serde_json::Value = client
+                .get(format!("{base2}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(st["rate_limit"], false);
+            for _ in 0..30 {
+                let r = client
+                    .get(format!("{base2}/v1/status"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(r.status().is_success());
+            }
         });
     }
 }

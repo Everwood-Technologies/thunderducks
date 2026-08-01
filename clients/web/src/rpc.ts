@@ -14,6 +14,8 @@ export type Status = {
   display_name?: string | null;
   claimed_at_ms?: number | null;
   pair_tokens_active?: number;
+  require_owner?: boolean;
+  rate_limit?: boolean;
 };
 
 export type ClaimStatus = {
@@ -146,7 +148,7 @@ export class TdRpcClient {
   }
 
   async status(): Promise<Status> {
-    const r = await fetch(this.url("/v1/status"));
+    const r = await fetch(this.url("/v1/status"), { headers: this.authHeaders() });
     if (!r.ok) throw new Error(`status HTTP ${r.status}`);
     return (await r.json()) as Status;
   }
@@ -154,7 +156,7 @@ export class TdRpcClient {
   async linkSecondary(): Promise<{ linked: boolean; secondary_device: string }> {
     const r = await fetch(this.url("/v1/devices/link-secondary"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({}),
     });
     if (!r.ok) throw new Error(`link HTTP ${r.status}`);
@@ -164,7 +166,7 @@ export class TdRpcClient {
   async createRoom(name: string): Promise<CreateRoomResponse> {
     const r = await fetch(this.url("/v1/rooms"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ name }),
     });
     if (!r.ok) throw new Error(`createRoom HTTP ${r.status}`);
@@ -174,7 +176,7 @@ export class TdRpcClient {
   async send(roomId: string, text: string): Promise<SendResponse> {
     const r = await fetch(this.url("/v1/messages"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ room_id: roomId, text }),
     });
     if (!r.ok) throw new Error(`send HTTP ${r.status}`);
@@ -184,7 +186,7 @@ export class TdRpcClient {
   async listMessages(roomId: string): Promise<MessagesResponse> {
     const r = await fetch(this.url("/v1/messages/list"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ room_id: roomId }),
     });
     if (!r.ok) throw new Error(`listMessages HTTP ${r.status}`);
@@ -200,7 +202,7 @@ export class TdRpcClient {
   ): Promise<WaitMessagesResponse> {
     const r = await fetch(this.url("/v1/messages/wait"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({
         room_id: roomId,
         since_count: sinceCount,
@@ -212,10 +214,11 @@ export class TdRpcClient {
     return (await r.json()) as WaitMessagesResponse;
   }
 
-  /** SSE URL for true push live updates (EventSource). */
+  /** SSE URL for true push live updates (EventSource). Includes owner_token query when gated. */
   messagesStreamUrl(roomId: string): string {
     const u = new URL(this.url("/v1/messages/stream"));
     u.searchParams.set("room_id", roomId);
+    if (this.ownerToken) u.searchParams.set("owner_token", this.ownerToken);
     return u.toString();
   }
 
@@ -278,7 +281,7 @@ export class TdRpcClient {
   }> {
     const r = await fetch(this.url("/v1/passkeys/register/begin"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ user_name: userName, display_name: displayName }),
     });
     if (!r.ok) throw new Error(`passkey begin HTTP ${r.status}`);
@@ -290,7 +293,7 @@ export class TdRpcClient {
   }
 
   async passkeyList(): Promise<{ credentials: { credential_id: string; label: string }[] }> {
-    const r = await fetch(this.url("/v1/passkeys"));
+    const r = await fetch(this.url("/v1/passkeys"), { headers: this.authHeaders() });
     if (!r.ok) throw new Error(`passkey list HTTP ${r.status}`);
     return (await r.json()) as { credentials: { credential_id: string; label: string }[] };
   }
@@ -301,7 +304,7 @@ export class TdRpcClient {
   ): Promise<{ ok: boolean; accepted_from_peer: number; pushed_accepted: number }> {
     const r = await fetch(this.url("/v1/sync/peer"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ peer_rpc: peerRpc, room_id: roomId }),
     });
     if (!r.ok) throw new Error(`syncPeer HTTP ${r.status}`);
@@ -315,7 +318,7 @@ export class TdRpcClient {
   async shareSession(peerRpc: string, roomId: string): Promise<void> {
     const r = await fetch(this.url("/v1/e2ee/share-session"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ peer_rpc: peerRpc, room_id: roomId }),
     });
     if (!r.ok) throw new Error(`shareSession HTTP ${r.status}`);
@@ -328,7 +331,7 @@ export class TdRpcClient {
   ): Promise<void> {
     const r = await fetch(this.url("/v1/peers"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ name, uri, rpc: opts?.rpc, p2p: opts?.p2p }),
     });
     if (!r.ok) throw new Error(`addPeer HTTP ${r.status}`);
@@ -422,7 +425,7 @@ export class TdRpcClient {
   }
 
   async pairList(): Promise<{ claimed: boolean; tokens: unknown[] }> {
-    const r = await fetch(this.url("/v1/pair"));
+    const r = await fetch(this.url("/v1/pair"), { headers: this.authHeaders() });
     if (!r.ok) throw new Error(`pair list HTTP ${r.status}`);
     return (await r.json()) as { claimed: boolean; tokens: unknown[] };
   }

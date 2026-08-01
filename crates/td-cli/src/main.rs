@@ -40,9 +40,12 @@ enum Commands {
         /// Untrusted assist relay URI (td://host:port).
         #[arg(long, env = "TD_RELAY_URI")]
         relay_uri: Option<String>,
-        /// Require owner session for admin routes when bind is non-loopback (default true).
+        /// Require owner session for non-public routes when bind is non-loopback (default true).
         #[arg(long, env = "TD_REQUIRE_OWNER", default_value_t = true)]
         require_owner: bool,
+        /// Per-IP rate limits (default true).
+        #[arg(long, env = "TD_RATE_LIMIT", default_value_t = true)]
+        rate_limit: bool,
     },
     /// Show node status
     Status,
@@ -92,6 +95,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             advertise_host,
             relay_uri,
             require_owner,
+            rate_limit,
         } => {
             let mut opts = td_node::ServeOptions::from_env();
             // CLI flags override env defaults when present.
@@ -108,6 +112,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 opts.relay_uri = relay_uri;
             }
             opts.require_owner_non_loopback = require_owner;
+            opts.rate_limit = rate_limit;
             td_node::serve_blocking_with_options(&bind, opts)
                 .await
                 .map_err(|e| e.to_string())?;

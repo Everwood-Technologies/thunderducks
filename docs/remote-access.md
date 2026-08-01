@@ -29,7 +29,8 @@ Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner
 | `TD_ADVERTISE_HOST` / `--advertise-host` | Host/IP rewritten into `rpc_base` + `p2p_uri` |
 | `TD_RELAY_URI` / `--relay-uri` | Assist relay `td://host:port` |
 | `TD_RELAY_PAD` | MVP seal pad byte (default `0x3C`) — shared demo secret, not real E2EE |
-| `TD_REQUIRE_OWNER` / `--require-owner` | When bind is **non-loopback**, require owner session for admin routes (default **true**) |
+| `TD_REQUIRE_OWNER` / `--require-owner` | When bind is **non-loopback**, require owner session for **non-public** routes (default **true**) |
+| `TD_RATE_LIMIT` / `--rate-limit` | Per-IP sliding-window rate limits (default **true**) |
 
 ```bash
 # Example: node reachable on tailnet IP for URI advertising; RPC still loopback + tailscale serve/proxy preferred
@@ -59,15 +60,32 @@ tducks serve --bind 0.0.0.0:8788 --data-dir /var/lib/thunderducks \
 
 Background poller runs every ~10s when `TD_RELAY_URI` is set.
 
-## Owner gate (non-loopback)
+## Owner gate + rate limits (P3.4)
 
 When `require_owner` is true (non-loopback bind + default flag):
 
-- **Always owner:** `POST /v1/pair` (unchanged)
-- **Also owner:** `POST /v1/peers`, `POST /v1/devices/link-secondary`, relay push/poll (if gate on)
-- **Open (still):** health, status, claim, recovery login, messages list/send on trust model
+| Class | Paths |
+|-------|--------|
+| **Public (no owner)** | `GET /health`, `GET /v1/status`, `GET/POST /v1/claim`, `POST /v1/recovery/login`, `GET/DELETE /v1/owner/session`, `POST /v1/pair/redeem`, `GET /v1/p2p`, `GET /v1/remote` |
+| **Owner required** | Everything else: rooms, messages, peers, devices, passkeys, e2ee, sync, pair mint/list, relay push/poll |
 
-This is a **first slice**, not full RPC authn. Chat paths remain open on the trust boundary you bind to — keep that boundary private (tailnet/LAN).
+Auth: `Authorization: Bearer <owner_token>` or `x-td-owner-token`. SSE may pass `?owner_token=` (EventSource cannot set headers).
+
+`POST /v1/pair` always requires owner (even on loopback).
+
+### Rate limits (per client IP, in-memory)
+
+| Bucket | Limit |
+|--------|--------|
+| `POST /v1/recovery/login`, `POST /v1/claim` | 10 / 60s |
+| `POST /v1/pair/redeem` | 20 / 60s |
+| `messages/wait`, `messages/stream` | 120 / 60s |
+| other writes | 180 / 60s |
+| other reads | 600 / 60s |
+
+Exceeding → `429` + `Retry-After`. Toggle with `TD_RATE_LIMIT=false` for local load tests only.
+
+Still not transport auth (TLS/Noise) — keep the bind private (tailnet/LAN).
 
 ## Tailnet recipe (recommended)
 

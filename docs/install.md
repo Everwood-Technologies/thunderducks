@@ -156,11 +156,12 @@ Pair tokens remain short-lived and in-memory by design.
 
 **Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + optional relay; owner gate off-loopback).
 
-**Still later Pond phases:** full RPC authn, production relay seal, OTA, Wi‑Fi wizard.
+**Still later Pond phases:** production relay seal, transport TLS/Noise, OTA, Wi‑Fi wizard.
 
 ## Security notes
 
 - DIY default: RPC on **localhost only**
-- Non-loopback bind → owner session required for admin mutations (pair/peers/link/relay)
+- Non-loopback bind → owner session required for **all non-public** routes (chat included)
+- Per-IP rate limits on by default (`TD_RATE_LIMIT`)
 - Service runs as unprivileged `tducks` with systemd hardening flags
 - Do **not** publish `:8788` to the public internet

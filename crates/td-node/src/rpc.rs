@@ -1,14 +1,17 @@
 //! Local node HTTP RPC for CLI + TS web (Wave E).
 //!
-//! Default bind is loopback. Non-loopback requires owner session for admin routes.
-//! Optional untrusted assist relay + advertised host for tailnet/LAN remote access.
+//! Default bind is loopback (trust-local). Non-loopback enables **full owner-session
+//! authn** for non-public routes plus **per-IP rate limits**. Optional untrusted
+//! assist relay + advertised host for tailnet/LAN remote access.
 
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -47,8 +50,10 @@ pub struct ServeOptions {
     pub relay_uri: Option<String>,
     /// XOR pad for MVP relay seal (demo-grade; not production E2EE-at-rest).
     pub relay_pad: u8,
-    /// When RPC is not loopback-only, require owner session for admin routes.
+    /// When RPC is not loopback-only, require owner session for non-public routes.
     pub require_owner_non_loopback: bool,
+    /// Enable per-IP rate limits (default true).
+    pub rate_limit: bool,
 }
 
 impl ServeOptions {
@@ -74,6 +79,12 @@ impl ServeOptions {
                 !(v == "0" || v == "false" || v == "off" || v == "no")
             })
             .unwrap_or(true);
+        let rate_limit = std::env::var("TD_RATE_LIMIT")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
         Self {
             data_dir,
             p2p_bind,
@@ -81,6 +92,7 @@ impl ServeOptions {
             relay_uri,
             relay_pad,
             require_owner_non_loopback,
+            rate_limit,
         }
     }
 }
@@ -162,8 +174,119 @@ impl RoomNotify {
 pub struct RpcState {
     inner: Arc<Mutex<NodeSession>>,
     notify: Arc<RoomNotify>,
-    /// When true, admin routes require owner session (set when RPC bind is non-loopback).
+    /// When true, non-public routes require owner session (set when RPC bind is non-loopback).
     require_owner: bool,
+    /// Per-IP rate limiter (shared).
+    rate_limits: Arc<Mutex<RateLimitBook>>,
+    /// Master switch for rate limits.
+    rate_limit_enabled: bool,
+}
+
+/// Sliding-window counters keyed by client IP + bucket name.
+#[derive(Debug, Default)]
+struct RateLimitBook {
+    /// key = "{ip}|{bucket}" -> window
+    windows: HashMap<String, RateWindow>,
+}
+
+#[derive(Debug, Clone)]
+struct RateWindow {
+    start: Instant,
+    count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateRule {
+    /// Requests allowed per window.
+    limit: u32,
+    /// Window length.
+    window: Duration,
+}
+
+impl RateLimitBook {
+    fn check(&mut self, ip: &str, bucket: &str, rule: RateRule) -> Result<(), Duration> {
+        let key = format!("{ip}|{bucket}");
+        let now = Instant::now();
+        let entry = self.windows.entry(key).or_insert(RateWindow {
+            start: now,
+            count: 0,
+        });
+        if now.duration_since(entry.start) >= rule.window {
+            entry.start = now;
+            entry.count = 0;
+        }
+        if entry.count >= rule.limit {
+            let retry = rule
+                .window
+                .checked_sub(now.duration_since(entry.start))
+                .unwrap_or(Duration::from_secs(1));
+            return Err(retry);
+        }
+        entry.count += 1;
+        // Opportunistic prune when map grows large.
+        if self.windows.len() > 4096 {
+            let cutoff = now - Duration::from_secs(120);
+            self.windows.retain(|_, w| w.start > cutoff);
+        }
+        Ok(())
+    }
+}
+
+fn rate_rule_for(path: &str, method: &str) -> RateRule {
+    // Sensitive auth / claim paths — tight.
+    if path == "/v1/recovery/login" || path == "/v1/claim" && method.eq_ignore_ascii_case("POST") {
+        return RateRule {
+            limit: 10,
+            window: Duration::from_secs(60),
+        };
+    }
+    if path == "/v1/pair/redeem" {
+        return RateRule {
+            limit: 20,
+            window: Duration::from_secs(60),
+        };
+    }
+    // Streaming / long-poll: allow steady traffic but cap.
+    if path == "/v1/messages/stream" || path == "/v1/messages/wait" {
+        return RateRule {
+            limit: 120,
+            window: Duration::from_secs(60),
+        };
+    }
+    // Writes vs reads.
+    if method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("DELETE")
+        || method.eq_ignore_ascii_case("PATCH")
+    {
+        RateRule {
+            limit: 180,
+            window: Duration::from_secs(60),
+        }
+    } else {
+        RateRule {
+            limit: 600,
+            window: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Paths that stay reachable without owner session even when `require_owner` is on.
+fn is_public_path(method: &str, path: &str) -> bool {
+    match (method.to_ascii_uppercase().as_str(), path) {
+        ("GET", "/health") => true,
+        ("GET", "/v1/status") => true,
+        ("GET", "/v1/claim") => true,
+        ("POST", "/v1/claim") => true, // handler rejects if already claimed
+        ("POST", "/v1/recovery/login") => true,
+        ("GET", "/v1/owner/session") => true,
+        ("DELETE", "/v1/owner/session") => true,
+        ("POST", "/v1/pair/redeem") => true,
+        // Lightweight discovery (no secrets)
+        ("GET", "/v1/p2p") => true,
+        ("GET", "/v1/remote") => true,
+        _ => false,
+    }
 }
 
 /// Known peer endpoints. HTTP RPC = reliable share+delta; P2P = best-effort.
@@ -441,6 +564,7 @@ pub struct StatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_uri: Option<String>,
     pub require_owner: bool,
+    pub rate_limit: bool,
     pub claimed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -707,6 +831,7 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         advertise_host: g.advertise_host.clone(),
         relay_uri: g.relay_uri.clone(),
         require_owner: st.require_owner,
+        rate_limit: st.rate_limit_enabled,
         claimed: g.claim.claimed,
         display_name: g.claim.display_name.clone(),
         claimed_at_ms: g.claim.claimed_at_ms,
@@ -807,7 +932,7 @@ fn require_owner(
     Ok(())
 }
 
-/// When node is in remote/non-loopback mode, require owner for admin mutations.
+/// When node is in remote/non-loopback mode, require owner for non-public routes.
 fn require_owner_if_remote(
     st: &RpcState,
     g: &mut NodeSession,
@@ -818,6 +943,102 @@ fn require_owner_if_remote(
     } else {
         Ok(())
     }
+}
+
+/// Extract owner token from headers, or `owner_token` query (SSE EventSource).
+fn extract_owner_token_flexible(headers: &HeaderMap, query_token: Option<&str>) -> Option<String> {
+    if let Some(t) = extract_owner_token(headers) {
+        return Some(t);
+    }
+    query_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn require_owner_token(
+    g: &mut NodeSession,
+    token: Option<String>,
+) -> Result<(), Box<Response>> {
+    let Some(token) = token else {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "owner session required (Authorization: Bearer <token>)".into(),
+                }),
+            )
+                .into_response(),
+        ));
+    };
+    if !g.owner_session_valid(&token) {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "invalid or expired owner session".into(),
+                }),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
+}
+
+async fn authn_rate_middleware(
+    State(st): State<RpcState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let ip = addr.ip().to_string();
+
+    // Rate limit first (including public routes).
+    if st.rate_limit_enabled {
+        let rule = rate_rule_for(&path, &method);
+        let mut book = st.rate_limits.lock().await;
+        if let Err(retry) = book.check(&ip, &path, rule) {
+            let secs = retry.as_secs().max(1);
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorBody {
+                    error: format!("rate limit exceeded; retry in ~{secs}s"),
+                }),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert("retry-after", v);
+            }
+            return resp;
+        }
+    }
+
+    // Full owner authn when non-loopback gate is on.
+    if st.require_owner && !is_public_path(&method, &path) {
+        // Allow owner_token query for EventSource (cannot set Authorization).
+        let q_token = req.uri().query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let mut it = pair.splitn(2, '=');
+                let k = it.next()?;
+                let v = it.next().unwrap_or("");
+                if k == "owner_token" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let headers = req.headers().clone();
+        let token = extract_owner_token_flexible(&headers, q_token.as_deref());
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner_token(&mut g, token) {
+            return *resp;
+        }
+    }
+
+    next.run(req).await
 }
 
 async fn claim_status(State(st): State<RpcState>) -> impl IntoResponse {
@@ -948,13 +1169,17 @@ async fn recovery_login(
     }
     let mut g = st.inner.lock().await;
     if let Some(secs) = g.recovery_locked() {
-        return (
+        let mut resp = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorBody {
                 error: format!("too many failed attempts; retry in {secs}s"),
             }),
         )
             .into_response();
+        if let Ok(v) = HeaderValue::from_str(&secs.max(1).to_string()) {
+            resp.headers_mut().insert("retry-after", v);
+        }
+        return resp;
     }
     if !g.claim.claimed {
         return (
@@ -2357,6 +2582,7 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
         "relay_last_error": g.relay_last_error,
         "relay_last_fetched": g.relay_last_fetched,
         "require_owner": st.require_owner,
+        "rate_limit": st.rate_limit_enabled,
         "peers": g.peers.values().collect::<Vec<_>>(),
     }))
     .into_response()
@@ -2467,6 +2693,10 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/remote", get(remote_status))
         .route("/v1/relay/poll", post(relay_poll_now))
         .route("/v1/relay/push", post(relay_push_now))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authn_rate_middleware,
+        ))
         .layer(cors)
         .with_state(state)
 }
@@ -2476,6 +2706,8 @@ pub fn new_state() -> RpcState {
         inner: Arc::new(Mutex::new(NodeSession::new())),
         notify: Arc::new(RoomNotify::new()),
         require_owner: false,
+        rate_limits: Arc::new(Mutex::new(RateLimitBook::default())),
+        rate_limit_enabled: true,
     }
 }
 
@@ -2500,6 +2732,8 @@ pub fn new_state_with_options(opts: ServeOptions) -> Result<RpcState, String> {
         inner: Arc::new(Mutex::new(session)),
         notify: Arc::new(RoomNotify::new()),
         require_owner: false,
+        rate_limits: Arc::new(Mutex::new(RateLimitBook::default())),
+        rate_limit_enabled: opts.rate_limit,
     })
 }
 
@@ -2698,7 +2932,11 @@ pub async fn serve_with_options(
     let app = router(state);
     eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     Ok(addr)
 }
@@ -2755,7 +2993,11 @@ pub async fn serve_blocking_with_options(
     };
     let app = router(state);
     eprintln!("td-node rpc listening on http://{addr} p2p={p2p}{notes}");
-    axum::serve(listener, app).await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 async fn prepare_serve(
