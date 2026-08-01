@@ -1,13 +1,19 @@
-//! Framed P2P event exchange over TCP (Wave B3).
+//! Framed P2P event exchange + opaque relay assist protocol (Waves B3 + D1).
 //!
-//! QUIC/Noise come later; MVP path is length-prefixed JSON SignedEvent frames
+//! QUIC/Noise come later; MVP path is length-prefixed JSON frames
 //! on localhost/manual peer URI (`td://host:port`).
 
 mod frame;
 mod peer;
+mod relay_client;
+mod relay_proto;
 
 pub use frame::{read_event, write_event, FrameError};
 pub use peer::{accept_once, dial, serve_exchange, PeerError, PeerUri};
+pub use relay_client::{RelayClient, RelayClientError};
+pub use relay_proto::{
+    read_json, write_json, RelayEnvelope, RelayProtoError, RelayRequest, RelayResponse,
+};
 
 /// Crate smoke marker used by CI.
 pub fn crate_name() -> &'static str {
@@ -37,7 +43,6 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let ev = read_event(&mut socket).await.unwrap();
                 verify_event(&ev).unwrap();
-                // echo ack by writing same event back
                 write_event(&mut socket, &ev).await.unwrap();
                 ev
             });
@@ -64,5 +69,16 @@ mod tests {
             let server_ev = server.await.unwrap();
             assert_eq!(server_ev.id, signed.id);
         });
+    }
+
+    #[test]
+    fn envelope_id_is_content_addressed() {
+        let a = DeviceKeypair::generate().event_device_id();
+        let b = DeviceKeypair::generate().event_device_id();
+        let e1 = RelayEnvelope::new(a, b, None, b"cipher".to_vec(), 1);
+        let e2 = RelayEnvelope::new(a, b, None, b"cipher".to_vec(), 1);
+        let e3 = RelayEnvelope::new(a, b, None, b"other".to_vec(), 1);
+        assert_eq!(e1.envelope_id, e2.envelope_id);
+        assert_ne!(e1.envelope_id, e3.envelope_id);
     }
 }

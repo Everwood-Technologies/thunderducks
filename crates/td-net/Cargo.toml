@@ -1,6 +1,6 @@
 [package]
 name = "td-net"
-description = "P2P transport and framed event exchange"
+description = "P2P transport, framed events, and opaque relay assist protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 td-crypto = { workspace = true }

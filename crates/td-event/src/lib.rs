@@ -10,8 +10,8 @@ mod store;
 
 pub use dag::{DagError, RoomDag};
 pub use event::{
-    canonical_bytes, event_id_from_bytes, sign_event, verify_event, DeviceId, EventId, EventKind,
-    RoomId, SignedEvent, UnsignedEvent,
+    canonical_bytes, event_id_from_bytes, sign_event, verify_event, DeviceId, EventError, EventId,
+    EventKind, RoomId, SignedEvent, UnsignedEvent,
 };
 pub use room::{
     room_id_from_parts, CreateRoomPayload, MemberState, MembershipAction, MembershipPayload,

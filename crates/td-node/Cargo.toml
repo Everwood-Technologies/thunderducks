@@ -1,6 +1,6 @@
 [package]
 name = "td-node"
-description = "Node runtime and local RPC"
+description = "Node runtime: multi-device sync, outbox/inbox, DAG convergence"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+td-event = { workspace = true }
+td-crypto = { workspace = true }
+td-net = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
