@@ -78,13 +78,21 @@ jobs:
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           STAGE="tducks-${VER}-${TARGET}"
-          mkdir -p "$STAGE"
+          mkdir -p "$STAGE" "$STAGE/packaging/systemd" "$STAGE/scripts"
           cp "target/${TARGET}/release/tducks" "$STAGE/tducks"
           chmod +x "$STAGE/tducks"
           cp README.md LICENSE "$STAGE/" 2>/dev/null || cp README.md "$STAGE/"
           cp packaging/systemd/tducks.service "$STAGE/"
+          cp packaging/systemd/tducks.service "$STAGE/packaging/systemd/"
+          cp packaging/systemd/tducks-ota-apply.service "$STAGE/packaging/systemd/"
+          cp packaging/systemd/tducks-ota-apply.path "$STAGE/packaging/systemd/"
           cp packaging/tducks.env.example "$STAGE/"
           cp scripts/install-tducks.sh "$STAGE/"
+          cp scripts/install-tducks.sh "$STAGE/scripts/"
+          cp scripts/tducks-ota-apply.sh "$STAGE/"
+          cp scripts/tducks-ota-apply.sh "$STAGE/scripts/"
+          chmod +x "$STAGE/install-tducks.sh" "$STAGE/tducks-ota-apply.sh" \
+            "$STAGE/scripts/install-tducks.sh" "$STAGE/scripts/tducks-ota-apply.sh"
           tar -czf "${STAGE}.tar.gz" "$STAGE"
           # Also flat-friendly name used by install script finder
           echo "asset=${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -120,3 +128,37 @@ jobs:
           files: dist/*.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # alpha/beta/rc tags are prereleases (install needs --version; not GitHub "latest")
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          make_latest: ${{ !(contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) }}
+          body: |
+            ## Thunderducks Pond DIY — ${{ github.ref_name }}
+
+            Linux **amd64** + **arm64** node binaries for alpha dogfood (Proxmox VM / bare metal).
+
+            ### Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Everwood-Technologies/thunderducks/main/scripts/install-tducks.sh \
+              | sudo TDUCKS_VERSION=${{ github.ref_name }} bash
+            # or
+            sudo ./scripts/install-tducks.sh --version ${{ github.ref_name }}
+            ```
+
+            Default RPC: `127.0.0.1:8788`. See `docs/install.md` and `docs/remote-access.md`.
+
+            ### Alpha scope
+
+            - Durable claim/identity (`TD_DATA_DIR`)
+            - Recovery login + owner session
+            - Tailnet + relay remote path (not open WAN)
+            - Olm relay seal v2 + AEAD v1 fallback
+            - Noise / QUIC P2P (optional pins + mTLS)
+            - OTA apply + single-slot rollback
+
+            ### Not in this alpha
+
+            - macOS / Docker appliance path
+            - Signed OTA manifest ceremony (optional pubkey still supported)
+            - Multi-version OTA history
+            - Retail factory image

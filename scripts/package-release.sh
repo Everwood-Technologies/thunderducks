@@ -25,13 +25,21 @@ fi
 [[ -x "$BIN" ]] || { echo "missing $BIN" >&2; exit 1; }
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE"
+mkdir -p "$STAGE" "$STAGE/packaging/systemd" "$STAGE/scripts"
 cp "$BIN" "$STAGE/tducks"
 chmod +x "$STAGE/tducks"
 cp README.md LICENSE "$STAGE/" 2>/dev/null || cp README.md "$STAGE/"
 cp packaging/systemd/tducks.service "$STAGE/"
+cp packaging/systemd/tducks.service "$STAGE/packaging/systemd/"
+cp packaging/systemd/tducks-ota-apply.service "$STAGE/packaging/systemd/"
+cp packaging/systemd/tducks-ota-apply.path "$STAGE/packaging/systemd/"
 cp packaging/tducks.env.example "$STAGE/"
 cp scripts/install-tducks.sh "$STAGE/"
+cp scripts/install-tducks.sh "$STAGE/scripts/"
+cp scripts/tducks-ota-apply.sh "$STAGE/"
+cp scripts/tducks-ota-apply.sh "$STAGE/scripts/"
+chmod +x "$STAGE/install-tducks.sh" "$STAGE/tducks-ota-apply.sh" \
+  "$STAGE/scripts/install-tducks.sh" "$STAGE/scripts/tducks-ota-apply.sh"
 mkdir -p "$OUT_DIR"
 tar -czf "$OUT_DIR/${STAGE_NAME}.tar.gz" -C "$OUT_DIR" "$STAGE_NAME"
 echo "wrote $OUT_DIR/${STAGE_NAME}.tar.gz"
