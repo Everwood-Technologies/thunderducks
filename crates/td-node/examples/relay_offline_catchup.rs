@@ -76,7 +76,7 @@ fn resolve_td_relay_bin() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    Err(format(
+    Err(format!(
         "td-relay binary not found; tried: {:?} — run: cargo build -p td-relay --bins",
         candidates,
     )
