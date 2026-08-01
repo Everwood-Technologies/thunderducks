@@ -56,6 +56,8 @@ packaging/
 
 Linux amd64/arm64 + systemd — see [`docs/install.md`](./docs/install.md).
 
+Proxmox Pond alpha (LXC/KVM + nginx UI): [`docs/proxmox-pond-alpha.md`](./docs/proxmox-pond-alpha.md) — `scripts/proxmox-pond-create.sh`.
+
 ```bash
 # from this repo after building:
 cargo build -p tducks --release

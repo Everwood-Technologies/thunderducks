@@ -155,6 +155,8 @@ Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
 
 Pair tokens remain short-lived and in-memory by design.
 
+**Proxmox alpha guest (KVM/LXC + nginx UI):** [`proxmox-pond-alpha.md`](./proxmox-pond-alpha.md).
+
 **Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + AEAD relay + optional Noise).
 
 **Appliance:** OTA auto-apply + Wi‑Fi — [`ota-wifi.md`](./ota-wifi.md) (`tducks-ota-apply.path`).  

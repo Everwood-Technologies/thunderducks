@@ -16,9 +16,13 @@
   <body>
     <div id="app"></div>
     <script type="module">
-      // For static preview after `npm run build`, point at local node RPC.
+      // After `npm run build`. Default: same-origin (nginx reverse-proxy to tducks).
+      // Local dev override: ?rpc=http://127.0.0.1:8788
       import { TdRpcClient, mountMinimalUi } from "./dist/rpc.js";
-      const rpc = new URLSearchParams(location.search).get("rpc") || "http://127.0.0.1:8788";
+      const params = new URLSearchParams(location.search);
+      const rpc =
+        params.get("rpc") ||
+        (location.protocol === "file:" ? "http://127.0.0.1:8788" : location.origin);
       mountMinimalUi(document.getElementById("app"), new TdRpcClient(rpc));
     </script>
   </body>

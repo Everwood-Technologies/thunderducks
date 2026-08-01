@@ -14,7 +14,7 @@ npm install
 npm test
 ```
 
-Open `index.html` (after `npm run build`) with `?rpc=http://127.0.0.1:8788` for a minimal UI.
+Open `index.html` (after `npm run build`). Defaults to **same-origin** (for nginx reverse-proxy). Local override: `?rpc=http://127.0.0.1:8788`.
 
 ## RPC surface
 
