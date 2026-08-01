@@ -6,14 +6,20 @@ export type Status = {
   event_count: number;
   rooms: string[];
   linked_devices: string[];
-  peers: { name: string; uri: string }[];
+  peers: { name: string; uri: string; rpc?: string | null; p2p?: string | null }[];
   passkey_credentials?: number;
   e2ee_default?: boolean;
   p2p_uri?: string | null;
 };
 
 export type CreateRoomResponse = { room_id: string; event_id: string };
-export type SendResponse = { event_id: string; ts_ms: number };
+export type SendResponse = {
+  event_id: string;
+  ts_ms: number;
+  fanout_ok?: number;
+  fanout_peers?: number;
+  fanout_errors?: string[];
+};
 export type MessageView = {
   event_id: string;
   author: string;
@@ -135,11 +141,15 @@ export class TdRpcClient {
     if (!r.ok) throw new Error(`shareSession HTTP ${r.status}`);
   }
 
-  async addPeer(name: string, uri: string): Promise<void> {
+  async addPeer(
+    name: string,
+    uri: string,
+    opts?: { rpc?: string; p2p?: string },
+  ): Promise<void> {
     const r = await fetch(this.url("/v1/peers"), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name, uri }),
+      body: JSON.stringify({ name, uri, rpc: opts?.rpc, p2p: opts?.p2p }),
     });
     if (!r.ok) throw new Error(`addPeer HTTP ${r.status}`);
   }
@@ -161,7 +171,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
     <div>
       <button id="link">Link secondary</button>
       <button id="room">Create room</button>
-      <button id="sync">Sync peers</button>
+      <button id="sync">Sync peers (manual)</button>
       <button id="refresh">Refresh msgs</button>
     </div>
     <div style="margin-top:0.5rem">
@@ -246,16 +256,21 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       return;
     }
     void (async () => {
-      const s = await client.send(roomId, text);
-      log(`sent ${s.event_id.slice(0, 12)}…`);
+      // Ensure node knows peer HTTP RPCs so server-side fanout works.
+      let i = 0;
       for (const peer of peerList()) {
+        i += 1;
         try {
-          await client.shareSession(peer, roomId);
-          await client.syncPeer(peer, roomId);
+          await client.addPeer(`peer${i}`, peer, { rpc: peer });
         } catch {
-          /* best-effort */
+          /* already added */
         }
       }
+      const s = await client.send(roomId, text);
+      const fo = s.fanout_ok ?? 0;
+      const fp = s.fanout_peers ?? 0;
+      log(`sent ${s.event_id.slice(0, 12)}… fanout ${fo}/${fp}`);
+      if (s.fanout_errors?.length) log(`fanout errs: ${s.fanout_errors.join("; ")}`);
       const msgs = await client.listMessages(roomId);
       log(JSON.stringify(msgs.messages, null, 2));
     })();

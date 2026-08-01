@@ -69,19 +69,19 @@ echo "alice device=${A_DEV:0:12}… p2p=$A_P2P rpc=$A"
 echo "bob   device=${B_DEV:0:12}… p2p=$B_P2P rpc=$B"
 echo "cara  device=${C_DEV:0:12}… p2p=$C_P2P rpc=$C"
 
-# remember peer P2P URIs (for send-time fanout)
+# register peers with BOTH http RPC (reliable fanout) and P2P (best-effort)
 curl -sf -X POST "$A/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"bob\",\"uri\":\"$B_P2P\"}" >/dev/null
+  -d "{\"name\":\"bob\",\"rpc\":\"$B\",\"p2p\":\"$B_P2P\"}" >/dev/null
 curl -sf -X POST "$A/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"cara\",\"uri\":\"$C_P2P\"}" >/dev/null
+  -d "{\"name\":\"cara\",\"rpc\":\"$C\",\"p2p\":\"$C_P2P\"}" >/dev/null
 curl -sf -X POST "$B/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"alice\",\"uri\":\"$A_P2P\"}" >/dev/null
+  -d "{\"name\":\"alice\",\"rpc\":\"$A\",\"p2p\":\"$A_P2P\"}" >/dev/null
 curl -sf -X POST "$B/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"cara\",\"uri\":\"$C_P2P\"}" >/dev/null
+  -d "{\"name\":\"cara\",\"rpc\":\"$C\",\"p2p\":\"$C_P2P\"}" >/dev/null
 curl -sf -X POST "$C/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"alice\",\"uri\":\"$A_P2P\"}" >/dev/null
+  -d "{\"name\":\"alice\",\"rpc\":\"$A\",\"p2p\":\"$A_P2P\"}" >/dev/null
 curl -sf -X POST "$C/v1/peers" -H 'content-type: application/json' \
-  -d "{\"name\":\"bob\",\"uri\":\"$B_P2P\"}" >/dev/null
+  -d "{\"name\":\"bob\",\"rpc\":\"$B\",\"p2p\":\"$B_P2P\"}" >/dev/null
 
 echo "== alice creates room =="
 ROOM=$(curl -sf -X POST "$A/v1/rooms" -H 'content-type: application/json' \
@@ -100,15 +100,11 @@ curl -sf -X POST "$A/v1/e2ee/share-session" -H 'content-type: application/json' 
 curl -sf -X POST "$A/v1/e2ee/share-session" -H 'content-type: application/json' \
   -d "{\"peer_rpc\":\"$C\",\"room_id\":\"$ROOM\"}" >/dev/null
 
-echo "== alice sends group message =="
-curl -sf -X POST "$A/v1/messages" -H 'content-type: application/json' \
-  -d "{\"room_id\":\"$ROOM\",\"text\":\"hello-pond-from-alice\"}" >/dev/null
-sleep 0.3
-# HTTP sync as reliable path (P2P fanout is best-effort)
-curl -sf -X POST "$B/v1/sync/peer" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$A\",\"room_id\":\"$ROOM\"}" >/dev/null
-curl -sf -X POST "$C/v1/sync/peer" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$A\",\"room_id\":\"$ROOM\"}" >/dev/null
+echo "== alice sends group message (auto fanout) =="
+ALICE_SEND=$(curl -sf -X POST "$A/v1/messages" -H 'content-type: application/json' \
+  -d "{\"room_id\":\"$ROOM\",\"text\":\"hello-pond-from-alice\"}")
+echo "alice send: $ALICE_SEND"
+sleep 0.2
 
 echo "== bob + cara list (decrypt) =="
 B_TXT=$(curl -sf -X POST "$B/v1/messages/list" -H 'content-type: application/json' \
@@ -122,30 +118,39 @@ if [[ "$B_TXT" != "hello-pond-from-alice" || "$C_TXT" != "hello-pond-from-alice"
   exit 1
 fi
 
-echo "== bob replies + resync =="
-curl -sf -X POST "$B/v1/messages" -H 'content-type: application/json' \
-  -d "{\"room_id\":\"$ROOM\",\"text\":\"hello-from-bob\"}" >/dev/null
-# Bob creates his own outbound session for replies — share Bob→Alice/Cara too
-curl -sf -X POST "$B/v1/e2ee/share-session" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$A\",\"room_id\":\"$ROOM\"}" >/dev/null
-curl -sf -X POST "$B/v1/e2ee/share-session" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$C\",\"room_id\":\"$ROOM\"}" >/dev/null
-curl -sf -X POST "$A/v1/sync/peer" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$B\",\"room_id\":\"$ROOM\"}" >/dev/null
-curl -sf -X POST "$C/v1/sync/peer" -H 'content-type: application/json' \
-  -d "{\"peer_rpc\":\"$B\",\"room_id\":\"$ROOM\"}" >/dev/null
+echo "== bob replies (auto fanout on send) =="
+BOB_SEND=$(curl -sf -X POST "$B/v1/messages" -H 'content-type: application/json' \
+  -d "{\"room_id\":\"$ROOM\",\"text\":\"hello-from-bob\"}")
+echo "bob send: $BOB_SEND"
+sleep 0.2
 
-A_N=$(curl -sf -X POST "$A/v1/messages/list" -H 'content-type: application/json' \
-  -d "{\"room_id\":\"$ROOM\"}" | json_get "len(d['messages'])")
-B_N=$(curl -sf -X POST "$B/v1/messages/list" -H 'content-type: application/json' \
-  -d "{\"room_id\":\"$ROOM\"}" | json_get "len(d['messages'])")
-C_N=$(curl -sf -X POST "$C/v1/messages/list" -H 'content-type: application/json' \
-  -d "{\"room_id\":\"$ROOM\"}" | json_get "len(d['messages'])")
+A_LIST=$(curl -sf -X POST "$A/v1/messages/list" -H 'content-type: application/json' \
+  -d "{\"room_id\":\"$ROOM\"}")
+B_LIST=$(curl -sf -X POST "$B/v1/messages/list" -H 'content-type: application/json' \
+  -d "{\"room_id\":\"$ROOM\"}")
+C_LIST=$(curl -sf -X POST "$C/v1/messages/list" -H 'content-type: application/json' \
+  -d "{\"room_id\":\"$ROOM\"}")
+A_N=$(printf '%s' "$A_LIST" | json_get "len(d['messages'])")
+B_N=$(printf '%s' "$B_LIST" | json_get "len(d['messages'])")
+C_N=$(printf '%s' "$C_LIST" | json_get "len(d['messages'])")
 echo "message counts A=$A_N B=$B_N C=$C_N"
+echo "alice texts: $(printf '%s' "$A_LIST" | json_get "[m.get('text') for m in d['messages']]")"
+echo "bob texts:   $(printf '%s' "$B_LIST" | json_get "[m.get('text') for m in d['messages']]")"
+echo "cara texts:  $(printf '%s' "$C_LIST" | json_get "[m.get('text') for m in d['messages']]")"
 if [[ "$A_N" -lt 2 || "$B_N" -lt 2 || "$C_N" -lt 2 ]]; then
   echo "FAIL: expected >=2 messages on each node" >&2
   exit 1
 fi
+for label_list in "alice:$A_LIST" "bob:$B_LIST" "cara:$C_LIST"; do
+  label="${label_list%%:*}"
+  body="${label_list#*:}"
+  if printf '%s' "$body" | grep -q 'e2ee:decrypt-failed'; then
+    echo "FAIL: $label has decrypt-failed (auto fanout broken)" >&2
+    printf '%s\n' "$body" >&2
+    exit 1
+  fi
+done
+echo "OK: all nodes decrypt both messages (send-just-works)"
 
 cat >"$STATE_DIR/endpoints.json" <<EOF
 {

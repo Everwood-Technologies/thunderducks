@@ -212,7 +212,9 @@ impl E2eeDevice {
             .map_err(|e| E2eeError::Codec(e.to_string()))?;
         let inbound = InboundGroupSession::new(&key, MegolmConfig::version_1());
         let sid = inbound.session_id();
-        self.inbound_megolm.insert(sid.clone(), inbound);
+        // Never overwrite an existing inbound: a later export is advanced past
+        // already-sent indices and would break decrypt of prior ciphertext.
+        self.inbound_megolm.entry(sid.clone()).or_insert(inbound);
         Ok(sid)
     }
 

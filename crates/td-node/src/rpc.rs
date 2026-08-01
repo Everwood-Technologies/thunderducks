@@ -27,20 +27,32 @@ pub struct RpcState {
     inner: Arc<Mutex<NodeSession>>,
 }
 
+/// Known peer endpoints. HTTP RPC = reliable share+delta; P2P = best-effort.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEndpoint {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc: Option<String>,
+}
+
 struct NodeSession {
     keypair: DeviceKeypair,
     node: DeviceNode,
     rooms: RoomRegistry,
-    /// peer name -> uri (`td://host:port` P2P and/or `http://host:port` RPC)
-    peers: HashMap<String, String>,
+    /// peer name -> endpoints (P2P and/or HTTP RPC)
+    peers: HashMap<String, PeerEndpoint>,
     link: LinkRegistry,
     passkeys: PasskeyRegistry,
     e2ee: E2eeDevice,
-    /// rooms with outbound Megolm session established
+    /// rooms where we own an outbound Megolm session (encrypt path)
     e2ee_rooms: HashMap<String, bool>,
     ts_counter: u64,
     /// local P2P listen URI once started
     p2p_uri: Option<String>,
+    /// local HTTP RPC base once serving
+    rpc_base: Option<String>,
 }
 
 impl NodeSession {
@@ -61,6 +73,7 @@ impl NodeSession {
             e2ee_rooms: HashMap::new(),
             ts_counter: 1,
             p2p_uri: None,
+            rpc_base: None,
         }
     }
 
@@ -69,12 +82,51 @@ impl NodeSession {
         self.ts_counter
     }
 
+    /// Ensure we can encrypt for this room (per-sender outbound Megolm).
+    /// Auto share-on-send makes multi-node decrypt work without a Sync button.
     fn ensure_room_e2ee(&mut self, room_hex: &str) {
         if self.e2ee_rooms.contains_key(room_hex) {
             return;
         }
         let _ = self.e2ee.create_group_session(room_hex);
         self.e2ee_rooms.insert(room_hex.to_string(), true);
+    }
+
+    fn upsert_peer(&mut self, name: &str, uri: &str, rpc: Option<&str>, p2p: Option<&str>) {
+        let mut ep = self.peers.remove(name).unwrap_or(PeerEndpoint {
+            name: name.to_string(),
+            p2p: None,
+            rpc: None,
+        });
+        let u = uri.trim();
+        if u.starts_with("http://") || u.starts_with("https://") {
+            ep.rpc = Some(u.trim_end_matches('/').to_string());
+        } else if u.starts_with("td://") {
+            ep.p2p = Some(u.to_string());
+        } else if !u.is_empty() {
+            ep.rpc = Some(format!("http://{}", u.trim_end_matches('/')));
+        }
+        if let Some(r) = rpc {
+            let r = r.trim().trim_end_matches('/');
+            if !r.is_empty() {
+                ep.rpc = Some(if r.starts_with("http") {
+                    r.to_string()
+                } else {
+                    format!("http://{r}")
+                });
+            }
+        }
+        if let Some(p) = p2p {
+            let p = p.trim();
+            if !p.is_empty() {
+                ep.p2p = Some(if p.starts_with("td://") {
+                    p.to_string()
+                } else {
+                    format!("td://{p}")
+                });
+            }
+        }
+        self.peers.insert(name.to_string(), ep);
     }
 
     /// Ingest a remote signed event into DAG + room registry.
@@ -107,7 +159,12 @@ pub struct StatusResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub name: String,
+    /// Back-compat single uri (prefers rpc, else p2p).
     pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +188,14 @@ pub struct SendRequest {
 pub struct SendResponse {
     pub event_id: String,
     pub ts_ms: u64,
+    /// Peers that accepted our session key + event delta.
+    #[serde(default)]
+    pub fanout_ok: usize,
+    /// Peers we attempted via HTTP RPC.
+    #[serde(default)]
+    pub fanout_peers: usize,
+    #[serde(default)]
+    pub fanout_errors: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +220,13 @@ pub struct MessagesResponse {
 #[derive(Debug, Deserialize)]
 pub struct AddPeerRequest {
     pub name: String,
-    pub uri: String,
+    /// Primary uri: `http://…` RPC and/or `td://…` P2P (auto-classified).
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub rpc: Option<String>,
+    #[serde(default)]
+    pub p2p: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,10 +319,19 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         .collect();
     let peers = g
         .peers
-        .iter()
-        .map(|(name, uri)| PeerInfo {
-            name: name.clone(),
-            uri: uri.clone(),
+        .values()
+        .map(|ep| {
+            let uri = ep
+                .rpc
+                .clone()
+                .or_else(|| ep.p2p.clone())
+                .unwrap_or_default();
+            PeerInfo {
+                name: ep.name.clone(),
+                uri,
+                rpc: ep.rpc.clone(),
+                p2p: ep.p2p.clone(),
+            }
         })
         .collect();
     Json(StatusResponse {
@@ -332,6 +412,9 @@ async fn send_message(
     let ts = g.next_ts();
     let room_hex = hex32(&room_id.0);
     g.ensure_room_e2ee(&room_hex);
+    // Export BEFORE encrypt: Megolm session_key() is at the current ratchet
+    // index; post-encrypt export starts after this ciphertext and peers fail.
+    let session_key_b64 = g.e2ee.export_group_session_key(&room_hex).ok();
     let plain = serde_json::to_vec(&serde_json::json!({ "text": req.text })).unwrap_or_default();
     let ct = match g.e2ee.megolm_encrypt(&room_hex, &plain) {
         Ok(c) => c,
@@ -386,24 +469,94 @@ async fn send_message(
     }
     let event_id = hex32(&signed.id.0);
     let ts_ms = signed.ts_ms;
-    let room_for_push = room_id;
-    let peers_snapshot: Vec<String> = g.peers.values().cloned().collect();
-    let events_to_push = g.node.list_events(&room_for_push);
+    let peers_snapshot: Vec<PeerEndpoint> = g.peers.values().cloned().collect();
+    let new_event = signed.clone();
+    let full_dag = g.node.list_events(&room_id);
     drop(g);
-    // Best-effort P2P fanout of full room DAG (parent-before-child).
-    for uri in peers_snapshot {
-        if let Ok(peer) = PeerUri::parse(&uri) {
-            let bundle = events_to_push.clone();
-            tokio::spawn(async move {
-                if let Ok(mut sock) = dial(&peer).await {
-                    for ev in bundle {
-                        let _ = write_event(&mut sock, &ev).await;
+
+    // Reliable path: HTTP share Megolm session + delta ingest (full DAG fallback).
+    let mut fanout_ok = 0usize;
+    let mut fanout_errors = Vec::new();
+    let fanout_peers = peers_snapshot.iter().filter(|p| p.rpc.is_some()).count();
+    if let Ok(client) = reqwest_client() {
+        for ep in &peers_snapshot {
+            let Some(rpc) = ep.rpc.as_ref() else {
+                continue;
+            };
+            let peer_base = rpc.trim_end_matches('/').to_string();
+
+            // 1) share current outbound Megolm key so peer can decrypt our sends
+            if let Some(ref key) = session_key_b64 {
+                match client
+                    .post(format!("{peer_base}/v1/e2ee/import-session"))
+                    .json(&serde_json::json!({ "session_key_b64": key }))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        fanout_errors.push(format!("{}: import HTTP {}", ep.name, r.status()));
+                        continue;
+                    }
+                    Err(e) => {
+                        fanout_errors.push(format!("{}: import {e}", ep.name));
+                        continue;
                     }
                 }
-            });
+            }
+
+            // 2) delta: try new event only; if peer missing parents, push full DAG once
+            let events_to_send = vec![new_event.clone()];
+            let accepted = match client
+                .post(format!("{peer_base}/v1/sync/ingest"))
+                .json(&serde_json::json!({ "events": events_to_send }))
+                .send()
+                .await
+            {
+                Ok(r) => r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("accepted").and_then(|x| x.as_u64()))
+                    .unwrap_or(0),
+                Err(e) => {
+                    fanout_errors.push(format!("{}: ingest {e}", ep.name));
+                    continue;
+                }
+            };
+            if accepted == 0 {
+                let _ = client
+                    .post(format!("{peer_base}/v1/sync/ingest"))
+                    .json(&serde_json::json!({ "events": full_dag }))
+                    .send()
+                    .await;
+            }
+            fanout_ok += 1;
         }
     }
-    Json(SendResponse { event_id, ts_ms }).into_response()
+
+    // Best-effort P2P: push only the new event (not full DAG every send).
+    for ep in peers_snapshot {
+        if let Some(uri) = ep.p2p {
+            if let Ok(peer) = PeerUri::parse(&uri) {
+                let ev = new_event.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut sock) = dial(&peer).await {
+                        let _ = write_event(&mut sock, &ev).await;
+                    }
+                });
+            }
+        }
+    }
+
+    Json(SendResponse {
+        event_id,
+        ts_ms,
+        fanout_ok,
+        fanout_peers,
+        fanout_errors,
+    })
+    .into_response()
 }
 
 async fn list_messages(
@@ -443,8 +596,10 @@ async fn add_peer(
     Json(req): Json<AddPeerRequest>,
 ) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
-    g.peers.insert(req.name.clone(), req.uri.clone());
-    Json(serde_json::json!({ "ok": true, "name": req.name, "uri": req.uri })).into_response()
+    let uri = req.uri.clone().unwrap_or_default();
+    g.upsert_peer(&req.name, &uri, req.rpc.as_deref(), req.p2p.as_deref());
+    let ep = g.peers.get(&req.name).cloned();
+    Json(serde_json::json!({ "ok": true, "peer": ep })).into_response()
 }
 
 async fn link_secondary(
@@ -944,7 +1099,8 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
     let g = st.inner.lock().await;
     Json(serde_json::json!({
         "p2p_uri": g.p2p_uri,
-        "peers": g.peers,
+        "rpc_base": g.rpc_base,
+        "peers": g.peers.values().collect::<Vec<_>>(),
     }))
     .into_response()
 }
@@ -1030,9 +1186,13 @@ pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
     let p2p = start_p2p_listener(state.clone())
         .await
         .unwrap_or_else(|_| "td://?".into());
-    let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
+    {
+        let mut g = state.inner.lock().await;
+        g.rpc_base = Some(format!("http://{addr}"));
+    }
+    let app = router(state);
     eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -1044,9 +1204,13 @@ pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
 pub async fn serve_blocking(bind: &str) -> Result<(), std::io::Error> {
     let state = new_state();
     let p2p = start_p2p_listener(state.clone()).await?;
-    let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
+    {
+        let mut g = state.inner.lock().await;
+        g.rpc_base = Some(format!("http://{addr}"));
+    }
+    let app = router(state);
     eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     axum::serve(listener, app).await
 }
