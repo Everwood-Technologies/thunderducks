@@ -32,11 +32,11 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 ## P3 — engineering depth (post-MVP)
 
-| ID | Item |
-|----|------|
-| P3.1 | QUIC transport (TCP framed is MVP fallback) |
-| P3.2 | SSE/websocket live message push (RPC is request/response today) |
-| P3.3 | Encrypted history catch-up packaging polish |
+| ID | Item | Status |
+|----|------|--------|
+| P3.1 | QUIC transport (TCP framed is MVP fallback) | open |
+| P3.2 | **SSE live message push** (`GET /v1/messages/stream`; WS later) | ✅ done (A2) |
+| P3.3 | Encrypted history catch-up packaging polish | open |
 | P3.4 | Rate limits / authn on node RPC if ever non-localhost |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |
 | P3.6 | Mobile / Tauri (explicitly deferred) |

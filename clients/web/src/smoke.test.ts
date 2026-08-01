@@ -90,6 +90,76 @@ test("web client enroll -> room -> send/recv against local rpc", async () => {
     assert.equal(idle.timed_out, true);
     assert.equal(idle.changed, false);
     assert.equal(idle.count, 1);
+
+    // A2 SSE: snapshot + messages event after send (fetch stream; no browser EventSource in node)
+    {
+      const esUrl = client.messagesStreamUrl(room.room_id);
+      const got: { type: string; count: number; text?: string }[] = [];
+      const ac = new AbortController();
+      const res = await fetch(esUrl, {
+        headers: { accept: "text/event-stream" },
+        signal: ac.signal,
+      });
+      assert.equal(res.status, 200);
+      assert.ok((res.headers.get("content-type") || "").includes("text/event-stream"));
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      let sentPush = false;
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        // Parse complete SSE blocks separated by blank line
+        for (;;) {
+          const sep = buf.indexOf("\n\n");
+          if (sep < 0) break;
+          const block = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          let evName = "message";
+          const dataLines: string[] = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) evName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          }
+          if (!dataLines.length) continue;
+          const j = JSON.parse(dataLines.join("\n")) as {
+            count: number;
+            messages: { text: string }[];
+          };
+          got.push({
+            type: evName,
+            count: j.count,
+            text: j.messages[j.messages.length - 1]?.text,
+          });
+          if (evName === "snapshot" && !sentPush) {
+            sentPush = true;
+            void client.send(room.room_id, "sse-push");
+          }
+          if (evName === "messages" && j.count >= 2) {
+            ac.abort();
+            break;
+          }
+        }
+        if (got.some((g) => g.type === "messages" && g.count >= 2)) break;
+      }
+      try {
+        ac.abort();
+      } catch {
+        /* ignore */
+      }
+      assert.ok(
+        got.some((g) => g.type === "snapshot"),
+        "missing snapshot; got=" + JSON.stringify(got),
+      );
+      assert.ok(
+        got.some((g) => g.type === "messages" && g.count >= 2),
+        "missing messages push; got=" + JSON.stringify(got),
+      );
+      const last = got.filter((g) => g.type === "messages").at(-1);
+      assert.equal(last?.text, "sse-push");
+    }
   } finally {
     if (child && !child.killed) {
       child.kill("SIGTERM");

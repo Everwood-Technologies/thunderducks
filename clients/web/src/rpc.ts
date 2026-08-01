@@ -114,6 +114,62 @@ export class TdRpcClient {
     return (await r.json()) as WaitMessagesResponse;
   }
 
+  /** SSE URL for true push live updates (EventSource). */
+  messagesStreamUrl(roomId: string): string {
+    const u = new URL(this.url("/v1/messages/stream"));
+    u.searchParams.set("room_id", roomId);
+    return u.toString();
+  }
+
+  /**
+   * Open SSE stream for room messages.
+   * Returns a closer. Prefer over long-poll when EventSource is available.
+   */
+  openMessagesStream(
+    roomId: string,
+    handlers: {
+      onSnapshot?: (msgs: MessageView[], count: number) => void;
+      onMessages?: (msgs: MessageView[], count: number) => void;
+      onError?: (err: Event) => void;
+    },
+  ): { close: () => void } {
+    const es = new EventSource(this.messagesStreamUrl(roomId));
+    const parse = (raw: string) => {
+      const j = JSON.parse(raw) as {
+        messages?: MessageView[];
+        count?: number;
+      };
+      return {
+        messages: j.messages ?? [],
+        count: j.count ?? (j.messages?.length ?? 0),
+      };
+    };
+    es.addEventListener("snapshot", (ev) => {
+      try {
+        const p = parse((ev as MessageEvent).data);
+        handlers.onSnapshot?.(p.messages, p.count);
+      } catch {
+        /* ignore */
+      }
+    });
+    es.addEventListener("messages", (ev) => {
+      try {
+        const p = parse((ev as MessageEvent).data);
+        handlers.onMessages?.(p.messages, p.count);
+      } catch {
+        /* ignore */
+      }
+    });
+    es.onerror = (err) => {
+      handlers.onError?.(err);
+    };
+    return {
+      close: () => {
+        es.close();
+      },
+    };
+  }
+
   async passkeyRegisterBegin(
     userName = "thunderducks-user",
     displayName = "Thunderducks User",
@@ -239,11 +295,15 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
   let sinceCount = 0;
   let lastRender = "";
   let waitAbort: AbortController | null = null;
+  let sseClose: (() => void) | null = null;
   let liveGen = 0;
+  const preferSse =
+    typeof EventSource !== "undefined" && params.get("live") !== "poll";
 
   const setLiveLabel = (extra = "") => {
+    const mode = preferSse ? "sse" : "long-poll";
     liveEl.textContent = liveEnabled
-      ? `live: on (long-poll) count=${sinceCount}${extra ? " · " + extra : ""}`
+      ? `live: on (${mode}) count=${sinceCount}${extra ? " · " + extra : ""}`
       : `live: off${extra ? " · " + extra : ""}`;
   };
 
@@ -278,6 +338,23 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
     liveGen += 1;
     waitAbort?.abort();
     waitAbort = null;
+    sseClose?.();
+    sseClose = null;
+  };
+
+  const peerSyncLoop = async (gen: number, roomId: string) => {
+    // Background peer sync so fan-in from other nodes reaches local DAG + SSE.
+    while (liveEnabled && gen === liveGen) {
+      const room = roomInput.value.trim() || roomId;
+      for (const peer of peerList()) {
+        try {
+          await client.syncPeer(peer, room);
+        } catch {
+          /* ignore */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
   };
 
   const startLive = () => {
@@ -293,7 +370,6 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
     }
     const gen = liveGen;
     void (async () => {
-      // Best-effort peer pull so inbound fanout from others appears on this node.
       await ensurePeers().catch(() => undefined);
       for (const peer of peerList()) {
         try {
@@ -307,6 +383,35 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       } catch (e) {
         setLiveLabel(`list fail: ${(e as Error).message}`);
       }
+      if (!liveEnabled || gen !== liveGen) return;
+
+      // True SSE path (default when EventSource exists).
+      if (preferSse) {
+        setLiveLabel("connecting");
+        const handle = client.openMessagesStream(roomId, {
+          onSnapshot: (msgs, count) => {
+            if (gen !== liveGen) return;
+            renderMessages(msgs, "sse snapshot");
+            sinceCount = count;
+            setLiveLabel();
+          },
+          onMessages: (msgs, count) => {
+            if (gen !== liveGen) return;
+            renderMessages(msgs, "sse update");
+            sinceCount = count;
+            setLiveLabel();
+          },
+          onError: () => {
+            if (gen !== liveGen) return;
+            setLiveLabel("sse reconnecting…");
+          },
+        });
+        sseClose = handle.close;
+        void peerSyncLoop(gen, roomId);
+        return;
+      }
+
+      // Long-poll fallback (?live=poll or no EventSource).
       while (liveEnabled && gen === liveGen) {
         const room = roomInput.value.trim();
         if (!room) {
@@ -314,7 +419,6 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
           await new Promise((r) => setTimeout(r, 1000));
           continue;
         }
-        // Opportunistic peer sync between waits (catches fan-in from other nodes).
         for (const peer of peerList()) {
           try {
             await client.syncPeer(peer, room);

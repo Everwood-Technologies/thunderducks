@@ -2,15 +2,18 @@
 //!
 //! Binds localhost only. In-memory single-device session for MVP smoke.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use td_crypto::{
     DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
     PasskeyRegistry,
@@ -20,14 +23,52 @@ use td_event::{
 };
 use td_net::{accept_once, dial, read_event, write_event, PeerUri};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::sync::{DeviceNode, SyncOffer};
 
+/// Room-scoped change signal for wait long-poll + SSE.
+#[derive(Debug, Clone)]
+struct RoomChange {
+    room_hex: String,
+    /// Message count at notify time (hint; subscribers re-snapshot).
+    #[allow(dead_code)]
+    count: usize,
+}
+
+/// Fan-out hub: broadcast for SSE subscribers; Notify for wait long-poll.
+struct RoomNotify {
+    tx: broadcast::Sender<RoomChange>,
+    tick: Arc<Notify>,
+}
+
+impl RoomNotify {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(256);
+        Self {
+            tx,
+            tick: Arc::new(Notify::new()),
+        }
+    }
+
+    fn notify(&self, room_hex: &str, count: usize) {
+        let _ = self.tx.send(RoomChange {
+            room_hex: room_hex.to_string(),
+            count,
+        });
+        self.tick.notify_waiters();
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<RoomChange> {
+        self.tx.subscribe()
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcState {
     inner: Arc<Mutex<NodeSession>>,
+    notify: Arc<RoomNotify>,
 }
 
 /// Known peer endpoints. HTTP RPC = reliable share+delta; P2P = best-effort.
@@ -557,6 +598,15 @@ async fn send_message(
         }
     }
 
+    // Wake wait long-poll + SSE subscribers on this node.
+    {
+        let count = {
+            let g = st.inner.lock().await;
+            g.node.list_messages(&room_id).len()
+        };
+        notify_room(&st, &room_hex, count);
+    }
+
     Json(SendResponse {
         event_id,
         ts_ms,
@@ -599,8 +649,40 @@ async fn list_messages(
     .into_response()
 }
 
+/// Snapshot decrypted messages for a room.
+async fn snapshot_messages(st: &RpcState, room_id: &RoomId) -> (usize, Vec<MessageView>) {
+    let mut g = st.inner.lock().await;
+    let msgs: Vec<MessageView> = g
+        .node
+        .list_messages(room_id)
+        .into_iter()
+        .map(|ev| {
+            let text = decrypt_message_text(&mut g.e2ee, &ev);
+            MessageView {
+                event_id: hex32(&ev.id.0),
+                author: hex32(&ev.author_device.0),
+                ts_ms: ev.ts_ms,
+                text,
+            }
+        })
+        .collect();
+    (msgs.len(), msgs)
+}
+
+fn notify_room(st: &RpcState, room_hex: &str, count: usize) {
+    st.notify.notify(room_hex, count);
+}
+
+async fn notify_room_from_id(st: &RpcState, room_id: &RoomId) {
+    let count = {
+        let g = st.inner.lock().await;
+        g.node.list_messages(room_id).len()
+    };
+    notify_room(st, &hex32(&room_id.0), count);
+}
+
 /// Long-poll until room message count != since_count or timeout.
-/// Returns the full message list (same shape as /v1/messages/list) plus wait metadata.
+/// Notify-driven (not busy-poll); rechecks on room change or timeout.
 async fn wait_messages(
     State(st): State<RpcState>,
     Json(req): Json<WaitMessagesRequest>,
@@ -612,31 +694,15 @@ async fn wait_messages(
         }
     };
     let timeout_ms = req.timeout_ms.unwrap_or(15_000).clamp(250, 30_000);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let since = req.since_count;
+    let room_hex = req.room_id.clone();
 
     loop {
-        let (count, messages) = {
-            let mut g = st.inner.lock().await;
-            let msgs: Vec<MessageView> = g
-                .node
-                .list_messages(&room_id)
-                .into_iter()
-                .map(|ev| {
-                    let text = decrypt_message_text(&mut g.e2ee, &ev);
-                    MessageView {
-                        event_id: hex32(&ev.id.0),
-                        author: hex32(&ev.author_device.0),
-                        ts_ms: ev.ts_ms,
-                        text,
-                    }
-                })
-                .collect();
-            (msgs.len(), msgs)
-        };
+        let (count, messages) = snapshot_messages(&st, &room_id).await;
         if count != since {
             return Json(serde_json::json!({
-                "room_id": req.room_id,
+                "room_id": room_hex,
                 "messages": messages,
                 "count": count,
                 "changed": true,
@@ -644,9 +710,10 @@ async fn wait_messages(
             }))
             .into_response();
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Json(serde_json::json!({
-                "room_id": req.room_id,
+                "room_id": room_hex,
                 "messages": messages,
                 "count": count,
                 "changed": false,
@@ -654,8 +721,99 @@ async fn wait_messages(
             }))
             .into_response();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let remaining = deadline - now;
+        let notified = st.notify.tick.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    room_id: String,
+}
+
+/// True SSE stream of message snapshots for a room.
+/// Events: `snapshot` (initial), `messages` (on change), comment keep-alives.
+async fn stream_messages(
+    State(st): State<RpcState>,
+    Query(q): Query<StreamQuery>,
+) -> impl IntoResponse {
+    let room_id = match parse_room_id(&q.room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+        }
+    };
+    let room_hex = q.room_id.clone();
+    let mut rx = st.notify.subscribe();
+
+    let (init_count, init_msgs) = snapshot_messages(&st, &room_id).await;
+    let init_payload = serde_json::json!({
+        "room_id": room_hex,
+        "messages": init_msgs,
+        "count": init_count,
+        "changed": false,
+        "event": "snapshot",
+    });
+
+    let st2 = st.clone();
+    let room_hex2 = room_hex.clone();
+    let stream = async_stream::stream! {
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("snapshot")
+                .data(init_payload.to_string())
+        );
+        let mut last_count = init_count;
+        loop {
+            match rx.recv().await {
+                Ok(change) => {
+                    if change.room_hex != room_hex2 {
+                        continue;
+                    }
+                    let (count, messages) = snapshot_messages(&st2, &room_id).await;
+                    if count == last_count {
+                        continue;
+                    }
+                    last_count = count;
+                    let payload = serde_json::json!({
+                        "room_id": room_hex2,
+                        "messages": messages,
+                        "count": count,
+                        "changed": true,
+                        "event": "messages",
+                    });
+                    yield Ok(Event::default().event("messages").data(payload.to_string()));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let (count, messages) = snapshot_messages(&st2, &room_id).await;
+                    last_count = count;
+                    let payload = serde_json::json!({
+                        "room_id": room_hex2,
+                        "messages": messages,
+                        "count": count,
+                        "changed": true,
+                        "event": "messages",
+                        "lagged": true,
+                    });
+                    yield Ok(Event::default().event("messages").data(payload.to_string()));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("td-ping"),
+        )
+        .into_response()
 }
 
 async fn add_peer(
@@ -938,15 +1096,25 @@ async fn sync_ingest(
     State(st): State<RpcState>,
     Json(req): Json<SyncIngestRequest>,
 ) -> impl IntoResponse {
-    let mut g = st.inner.lock().await;
+    let mut touched: HashSet<[u8; 32]> = HashSet::new();
     let mut accepted = 0usize;
     let mut errors = Vec::new();
-    for ev in req.events {
-        match g.ingest_remote(ev) {
-            Ok(true) => accepted += 1,
-            Ok(false) => {}
-            Err(e) => errors.push(e),
+    {
+        let mut g = st.inner.lock().await;
+        for ev in req.events {
+            let rid = ev.room_id.0;
+            match g.ingest_remote(ev) {
+                Ok(true) => {
+                    accepted += 1;
+                    touched.insert(rid);
+                }
+                Ok(false) => {}
+                Err(e) => errors.push(e),
+            }
         }
+    }
+    for rid in touched {
+        notify_room_from_id(&st, &RoomId(rid)).await;
     }
     Json(serde_json::json!({ "accepted": accepted, "errors": errors })).into_response()
 }
@@ -1331,6 +1499,7 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/messages", post(send_message))
         .route("/v1/messages/list", post(list_messages))
         .route("/v1/messages/wait", post(wait_messages))
+        .route("/v1/messages/stream", get(stream_messages))
         .route("/v1/sync/offer", post(sync_offer))
         .route("/v1/sync/ingest", post(sync_ingest))
         .route("/v1/sync/peer", post(sync_peer))
@@ -1347,6 +1516,7 @@ pub fn router(state: RpcState) -> Router {
 pub fn new_state() -> RpcState {
     RpcState {
         inner: Arc::new(Mutex::new(NodeSession::new())),
+        notify: Arc::new(RoomNotify::new()),
     }
 }
 
@@ -1370,8 +1540,14 @@ async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
                 loop {
                     match read_event(&mut sock).await {
                         Ok(ev) => {
-                            let mut g = st2.inner.lock().await;
-                            let _ = g.ingest_remote(ev);
+                            let room_id = ev.room_id;
+                            let inserted = {
+                                let mut g = st2.inner.lock().await;
+                                g.ingest_remote(ev).unwrap_or(false)
+                            };
+                            if inserted {
+                                notify_room_from_id(&st2, &room_id).await;
+                            }
                         }
                         Err(_) => break,
                     }
