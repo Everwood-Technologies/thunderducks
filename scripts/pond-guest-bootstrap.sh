@@ -31,11 +31,21 @@ export DEBIAN_FRONTEND=noninteractive
 log() { echo "pond-guest: $*"; }
 die() { echo "pond-guest: error: $*" >&2; exit 1; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
-
 apt_install() {
   apt-get update -y
   apt-get install -y --no-install-recommends "$@"
+}
+
+disable_host_firewall_http() {
+  # LXC templates sometimes enable ufw with default deny; open HTTP for alpha LAN.
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi 'Status: active'; then
+      log "ufw active — allowing ${HTTP_PORT}/tcp"
+      ufw allow "${HTTP_PORT}/tcp" || true
+      ufw allow OpenSSH || true
+    fi
+  fi
+  # nftables/iptables hard deny is uncommon on fresh Ubuntu CT; skip unless present.
 }
 
 log "apt packages (curl ca-certificates nginx unzip)"
@@ -45,8 +55,8 @@ if [[ "$SKIP_TDUCKS" != "1" ]]; then
   log "install tducks ${VERSION}"
   curl -fsSL "${RAW}/main/scripts/install-tducks.sh" \
     | TDUCKS_VERSION="${VERSION}" TDUCKS_REPO="${REPO}" bash
-  systemctl enable --now tducks.service
-  # Ensure loopback RPC (nginx proxies; do not LAN-bind admin RPC by default)
+  systemctl enable --now tducks.service || true
+  mkdir -p /etc/thunderducks
   if [[ -f /etc/thunderducks/tducks.env ]]; then
     if grep -q '^TD_BIND=' /etc/thunderducks/tducks.env 2>/dev/null; then
       sed -i 's|^TD_BIND=.*|TD_BIND=127.0.0.1:8788|' /etc/thunderducks/tducks.env
@@ -54,7 +64,6 @@ if [[ "$SKIP_TDUCKS" != "1" ]]; then
       echo 'TD_BIND=127.0.0.1:8788' >>/etc/thunderducks/tducks.env
     fi
   else
-    mkdir -p /etc/thunderducks
     cat >/etc/thunderducks/tducks.env <<'EOF'
 # Pond guest defaults — RPC stays loopback; nginx serves UI + proxies /v1
 TD_BIND=127.0.0.1:8788
@@ -72,7 +81,6 @@ if [[ "$SKIP_NGINX" != "1" ]]; then
   POND_WEB_TMP="$(mktemp -d)"
   trap 'rm -rf "${POND_WEB_TMP:-}" 2>/dev/null || true' EXIT
 
-  # Prefer sparse raw fetches (no full git clone required).
   fetch() {
     local path="$1" dest="$2"
     curl -fsSL "${RAW}/${WEB_REF}/${path}" -o "$dest" \
@@ -88,54 +96,109 @@ if [[ "$SKIP_NGINX" != "1" ]]; then
   fetch clients/web/src/index.ts "${POND_WEB_TMP}/src/index.ts"
   fetch clients/web/src/smoke.test.ts "${POND_WEB_TMP}/src/smoke.test.ts" || true
 
-  if command -v npm >/dev/null 2>&1 || apt-get install -y --no-install-recommends npm >/dev/null 2>&1; then
-    log "build web client (tsc)"
-    (
-      cd "${POND_WEB_TMP}"
-      # Minimal build: only need dist/rpc.js + types optional
-      npm install --no-audit --no-fund >/dev/null
-      npx --yes tsc -p tsconfig.json
-      cp -a dist/*.js "${WEB_ROOT}/dist/" 2>/dev/null || true
-      # index may import ./dist/rpc.js
-      [[ -f dist/rpc.js ]] || die "web build missing dist/rpc.js"
-      cp -a dist/rpc.js "${WEB_ROOT}/dist/rpc.js"
-      [[ -f dist/index.js ]] && cp -a dist/index.js "${WEB_ROOT}/dist/index.js" || true
-    )
-  else
-    die "npm/tsc unavailable — cannot build web UI"
+  if ! command -v npm >/dev/null 2>&1; then
+    apt_install npm
   fi
-
-  # Patch index.html import path is already ./dist/rpc.js
-  chown -R www-data:www-data "${WEB_ROOT}" 2>/dev/null || chown -R nginx:nginx "${WEB_ROOT}" 2>/dev/null || true
+  log "build web client (tsc)"
+  (
+    cd "${POND_WEB_TMP}"
+    npm install --no-audit --no-fund >/dev/null
+    npx --yes tsc -p tsconfig.json
+    [[ -f dist/rpc.js ]] || die "web build missing dist/rpc.js"
+    cp -a dist/rpc.js "${WEB_ROOT}/dist/rpc.js"
+    [[ -f dist/index.js ]] && cp -a dist/index.js "${WEB_ROOT}/dist/index.js" || true
+  )
+  chown -R www-data:www-data "${WEB_ROOT}" 2>/dev/null || true
 
   log "install nginx site"
   conf_dst="/etc/nginx/sites-available/pond-ui.conf"
   fetch packaging/nginx/pond-ui.conf "$conf_dst"
-  # Optional non-80 port
   if [[ "$HTTP_PORT" != "80" ]]; then
-    sed -i "s/listen 80/listen ${HTTP_PORT}/g; s/listen \\[::\\]:80/listen [::]:${HTTP_PORT}/g" "$conf_dst"
+    sed -i \
+      -e "s/listen 80 default_server/listen ${HTTP_PORT} default_server/g" \
+      -e "s/listen \\[::\\]:80 default_server/listen [::]:${HTTP_PORT} default_server/g" \
+      -e "s/listen 80;/listen ${HTTP_PORT};/g" \
+      -e "s/listen \\[::\\]:80;/listen [::]:${HTTP_PORT};/g" \
+      "$conf_dst"
   fi
-  rm -f /etc/nginx/sites-enabled/default
+
+  # Own :80 exclusively
+  rm -f /etc/nginx/sites-enabled/default \
+        /etc/nginx/sites-enabled/default.conf \
+        /etc/nginx/sites-enabled/*default* 2>/dev/null || true
+  if [[ -f /etc/nginx/conf.d/default.conf ]]; then
+    mv -f /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled || true
+  fi
   ln -sfn "$conf_dst" /etc/nginx/sites-enabled/pond-ui.conf
+
+  # Ensure nginx.conf includes sites-enabled (Debian/Ubuntu default)
+  if ! grep -q 'sites-enabled' /etc/nginx/nginx.conf 2>/dev/null; then
+    log "warn: nginx.conf may not include sites-enabled — check manually"
+  fi
+
   nginx -t
-  systemctl enable --now nginx
-  systemctl reload nginx
+  systemctl enable nginx
+  systemctl restart nginx
+  sleep 1
+  disable_host_firewall_http
 else
   log "skip nginx"
 fi
 
-# Health checks
 log "verify tducks health"
-for _ in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:8788/health >/dev/null; then
+td_body=""
+for _ in $(seq 1 40); do
+  td_body="$(curl -sS --max-time 3 http://127.0.0.1:8788/health 2>/dev/null || true)"
+  if printf '%s' "$td_body" | grep -q '"ok"'; then
     break
   fi
   sleep 0.5
 done
-curl -sf http://127.0.0.1:8788/health | grep -q ok || die "tducks /health failed"
+printf '%s' "$td_body" | grep -q '"ok"' || die "tducks /health failed (got: ${td_body:-empty}). Is tducks running?"
+
 if [[ "$SKIP_NGINX" != "1" ]]; then
-  curl -sf "http://127.0.0.1:${HTTP_PORT}/health" | grep -q ok || die "nginx /health proxy failed"
-  curl -sf "http://127.0.0.1:${HTTP_PORT}/" | grep -qi thunderducks || die "nginx UI root failed"
+  log "verify nginx proxy + UI"
+  ngx_body=""
+  ngx_ok=0
+  for _ in $(seq 1 20); do
+    ngx_body="$(curl -sS --max-time 5 -4 -H 'Host: localhost' \
+      "http://127.0.0.1:${HTTP_PORT}/health" 2>/dev/null || true)"
+    if printf '%s' "$ngx_body" | grep -q '"ok"'; then
+      ngx_ok=1
+      break
+    fi
+    # 502 right after restart — give tducks/nginx another beat
+    sleep 0.5
+  done
+  if [[ "$ngx_ok" -ne 1 ]]; then
+    log "nginx /health proxy failed — diagnostics follow"
+    echo "=== tducks ==="
+    systemctl --no-pager --full status tducks || true
+    curl -sS -D- --max-time 3 http://127.0.0.1:8788/health || true
+    echo
+    echo "=== nginx ==="
+    systemctl --no-pager --full status nginx || true
+    curl -sS -D- --max-time 3 -4 "http://127.0.0.1:${HTTP_PORT}/health" || true
+    echo
+    echo "=== listeners ==="
+    ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null || true
+    echo "=== enabled sites ==="
+    ls -la /etc/nginx/sites-enabled/ 2>/dev/null || true
+    echo "=== nginx -T (listen/proxy) ==="
+    nginx -T 2>/dev/null | grep -E 'listen |server_name|location|proxy_pass|root ' | head -100 || true
+    die "nginx /health proxy failed (got: ${ngx_body:-empty})"
+  fi
+
+  root_body="$(curl -sS --max-time 5 -4 "http://127.0.0.1:${HTTP_PORT}/" 2>/dev/null || true)"
+  printf '%s' "$root_body" | grep -qi thunderducks \
+    || die "nginx UI root failed (first 200: $(printf '%.200s' "${root_body:-empty}"))"
+
+  # Confirm nginx is not loopback-only
+  if ss -lntp 2>/dev/null | grep -E ":${HTTP_PORT}\\b" | grep -q '127.0.0.1'; then
+    if ! ss -lntp 2>/dev/null | grep -E ":${HTTP_PORT}\\b" | grep -qvE '127.0.0.1|\[::1\]'; then
+      log "warn: port ${HTTP_PORT} may be loopback-only — check listen directives"
+    fi
+  fi
 fi
 
 ip_guess="$(hostname -I 2>/dev/null | awk '{print $1}')"
