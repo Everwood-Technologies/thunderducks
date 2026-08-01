@@ -203,6 +203,17 @@ pub struct RoomQuery {
     pub room_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WaitMessagesRequest {
+    pub room_id: String,
+    /// Return immediately if message count differs from this (default 0).
+    #[serde(default)]
+    pub since_count: usize,
+    /// Max wait in milliseconds (clamped 250..=30000, default 15000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageView {
     pub event_id: String,
@@ -589,6 +600,65 @@ async fn list_messages(
         messages,
     })
     .into_response()
+}
+
+/// Long-poll until room message count != since_count or timeout.
+/// Returns the full message list (same shape as /v1/messages/list) plus wait metadata.
+async fn wait_messages(
+    State(st): State<RpcState>,
+    Json(req): Json<WaitMessagesRequest>,
+) -> impl IntoResponse {
+    let room_id = match parse_room_id(&req.room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+        }
+    };
+    let timeout_ms = req.timeout_ms.unwrap_or(15_000).clamp(250, 30_000);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let since = req.since_count;
+
+    loop {
+        let (count, messages) = {
+            let mut g = st.inner.lock().await;
+            let msgs: Vec<MessageView> = g
+                .node
+                .list_messages(&room_id)
+                .into_iter()
+                .map(|ev| {
+                    let text = decrypt_message_text(&mut g.e2ee, &ev);
+                    MessageView {
+                        event_id: hex32(&ev.id.0),
+                        author: hex32(&ev.author_device.0),
+                        ts_ms: ev.ts_ms,
+                        text,
+                    }
+                })
+                .collect();
+            (msgs.len(), msgs)
+        };
+        if count != since {
+            return Json(serde_json::json!({
+                "room_id": req.room_id,
+                "messages": messages,
+                "count": count,
+                "changed": true,
+                "timed_out": false,
+            }))
+            .into_response();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Json(serde_json::json!({
+                "room_id": req.room_id,
+                "messages": messages,
+                "count": count,
+                "changed": false,
+                "timed_out": true,
+            }))
+            .into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 async fn add_peer(
@@ -1131,6 +1201,7 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/rooms", post(create_room))
         .route("/v1/messages", post(send_message))
         .route("/v1/messages/list", post(list_messages))
+        .route("/v1/messages/wait", post(wait_messages))
         .route("/v1/sync/offer", post(sync_offer))
         .route("/v1/sync/ingest", post(sync_ingest))
         .route("/v1/sync/peer", post(sync_peer))

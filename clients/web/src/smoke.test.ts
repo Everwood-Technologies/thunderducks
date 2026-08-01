@@ -78,6 +78,18 @@ test("web client enroll -> room -> send/recv against local rpc", async () => {
     const msgs = await client.listMessages(room.room_id);
     assert.equal(msgs.messages.length, 1);
     assert.equal(msgs.messages[0]?.text, "from-ts-web");
+
+    // long-poll: already have 1 message → since_count=0 returns immediately changed
+    const waited = await client.waitMessages(room.room_id, 0, 2000);
+    assert.equal(waited.changed, true);
+    assert.equal(waited.count, 1);
+    assert.equal(waited.messages[0]?.text, "from-ts-web");
+
+    // timeout path: since_count matches → timed_out
+    const idle = await client.waitMessages(room.room_id, 1, 400);
+    assert.equal(idle.timed_out, true);
+    assert.equal(idle.changed, false);
+    assert.equal(idle.count, 1);
   } finally {
     if (child && !child.killed) {
       child.kill("SIGTERM");

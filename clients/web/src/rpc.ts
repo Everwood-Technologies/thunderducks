@@ -27,6 +27,11 @@ export type MessageView = {
   text: string;
 };
 export type MessagesResponse = { room_id: string; messages: MessageView[] };
+export type WaitMessagesResponse = MessagesResponse & {
+  count: number;
+  changed: boolean;
+  timed_out: boolean;
+};
 
 export class TdRpcClient {
   constructor(public baseUrl: string) {}
@@ -86,6 +91,27 @@ export class TdRpcClient {
     });
     if (!r.ok) throw new Error(`listMessages HTTP ${r.status}`);
     return (await r.json()) as MessagesResponse;
+  }
+
+  /** Long-poll until message count changes or timeout (server clamps 250–30000ms). */
+  async waitMessages(
+    roomId: string,
+    sinceCount: number,
+    timeoutMs = 15000,
+    signal?: AbortSignal,
+  ): Promise<WaitMessagesResponse> {
+    const r = await fetch(this.url("/v1/messages/wait"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        room_id: roomId,
+        since_count: sinceCount,
+        timeout_ms: timeoutMs,
+      }),
+      signal,
+    });
+    if (!r.ok) throw new Error(`waitMessages HTTP ${r.status}`);
+    return (await r.json()) as WaitMessagesResponse;
   }
 
   async passkeyRegisterBegin(
@@ -161,9 +187,11 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
   const presetRoom = params.get("room");
   const nodeName = params.get("name") || "node";
   const peerParam = params.get("peers") || "";
+  const liveOff = params.get("live") === "0";
   root.innerHTML = `
     <h1>Thunderducks <small style="font-weight:normal;color:#666">${nodeName}</small></h1>
     <p id="status">connecting…</p>
+    <p id="live" style="font-size:0.85rem;color:#555">live: off</p>
     <p style="font-size:0.9rem;color:#444">
       RPC <code id="rpcurl"></code>
       · room <input id="roomId" placeholder="room hex" style="min-width:18rem" />
@@ -173,6 +201,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       <button id="room">Create room</button>
       <button id="sync">Sync peers (manual)</button>
       <button id="refresh">Refresh msgs</button>
+      <button id="liveToggle">Live on/off</button>
     </div>
     <div style="margin-top:0.5rem">
       <input id="msg" placeholder="message" />
@@ -184,6 +213,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
   (root.querySelector("#rpcurl") as HTMLElement).textContent = client.baseUrl;
   const roomInput = root.querySelector("#roomId") as HTMLInputElement;
   const peersInput = root.querySelector("#peers") as HTMLInputElement;
+  const liveEl = root.querySelector("#live") as HTMLElement;
   if (presetRoom) roomInput.value = presetRoom;
   if (peerParam) peersInput.value = peerParam;
   else {
@@ -205,6 +235,112 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       .map((s) => s.trim())
       .filter(Boolean);
 
+  let liveEnabled = !liveOff;
+  let sinceCount = 0;
+  let lastRender = "";
+  let waitAbort: AbortController | null = null;
+  let liveGen = 0;
+
+  const setLiveLabel = (extra = "") => {
+    liveEl.textContent = liveEnabled
+      ? `live: on (long-poll) count=${sinceCount}${extra ? " · " + extra : ""}`
+      : `live: off${extra ? " · " + extra : ""}`;
+  };
+
+  const renderMessages = (msgs: MessageView[], note?: string) => {
+    const body = JSON.stringify(msgs, null, 2);
+    if (body !== lastRender) {
+      lastRender = body;
+      log(note ? `${note}\n${body}` : body);
+    }
+    sinceCount = msgs.length;
+    setLiveLabel();
+  };
+
+  const ensurePeers = async () => {
+    let i = 0;
+    for (const peer of peerList()) {
+      i += 1;
+      try {
+        await client.addPeer(`peer${i}`, peer, { rpc: peer });
+      } catch {
+        /* already added */
+      }
+    }
+  };
+
+  const pullOnce = async (roomId: string) => {
+    const msgs = await client.listMessages(roomId);
+    renderMessages(msgs.messages);
+  };
+
+  const stopLive = () => {
+    liveGen += 1;
+    waitAbort?.abort();
+    waitAbort = null;
+  };
+
+  const startLive = () => {
+    stopLive();
+    if (!liveEnabled) {
+      setLiveLabel();
+      return;
+    }
+    const roomId = roomInput.value.trim();
+    if (!roomId) {
+      setLiveLabel("set room id");
+      return;
+    }
+    const gen = liveGen;
+    void (async () => {
+      // Best-effort peer pull so inbound fanout from others appears on this node.
+      await ensurePeers().catch(() => undefined);
+      for (const peer of peerList()) {
+        try {
+          await client.syncPeer(peer, roomId);
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        await pullOnce(roomId);
+      } catch (e) {
+        setLiveLabel(`list fail: ${(e as Error).message}`);
+      }
+      while (liveEnabled && gen === liveGen) {
+        const room = roomInput.value.trim();
+        if (!room) {
+          setLiveLabel("set room id");
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        // Opportunistic peer sync between waits (catches fan-in from other nodes).
+        for (const peer of peerList()) {
+          try {
+            await client.syncPeer(peer, room);
+          } catch {
+            /* ignore */
+          }
+        }
+        waitAbort = new AbortController();
+        try {
+          const w = await client.waitMessages(room, sinceCount, 12000, waitAbort.signal);
+          if (gen !== liveGen) return;
+          if (w.changed || w.messages.length !== sinceCount) {
+            renderMessages(w.messages, w.changed ? "live update" : undefined);
+          } else {
+            sinceCount = w.count;
+            setLiveLabel(w.timed_out ? "idle" : "");
+          }
+        } catch (e) {
+          if ((e as Error).name === "AbortError") return;
+          setLiveLabel(`wait fail: ${(e as Error).message}`);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    })();
+  };
+
   void client.status().then((st) => {
     (root.querySelector("#status") as HTMLElement).textContent =
       `device ${st.device_id.slice(0, 12)}… events=${st.event_count} e2ee=${st.e2ee_default ?? false} p2p=${st.p2p_uri ?? "—"}`;
@@ -219,6 +355,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
     void client.createRoom(`web-${nodeName}`).then((r) => {
       roomInput.value = r.room_id;
       log(`room ${r.room_id.slice(0, 12)}…`);
+      if (liveEnabled) startLive();
     });
   });
   root.querySelector("#sync")!.addEventListener("click", () => {
@@ -238,15 +375,24 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
         }
       }
       const msgs = await client.listMessages(roomId);
-      log(JSON.stringify(msgs.messages, null, 2));
+      renderMessages(msgs.messages, "manual sync");
     })();
   });
   root.querySelector("#refresh")!.addEventListener("click", () => {
     const roomId = roomInput.value.trim();
     if (!roomId) return;
-    void client
-      .listMessages(roomId)
-      .then((msgs) => log(JSON.stringify(msgs.messages, null, 2)));
+    void pullOnce(roomId).catch((e) => log(`refresh fail: ${(e as Error).message}`));
+  });
+  root.querySelector("#liveToggle")!.addEventListener("click", () => {
+    liveEnabled = !liveEnabled;
+    if (liveEnabled) startLive();
+    else {
+      stopLive();
+      setLiveLabel();
+    }
+  });
+  roomInput.addEventListener("change", () => {
+    if (liveEnabled) startLive();
   });
   root.querySelector("#send")!.addEventListener("click", () => {
     const text = (root.querySelector("#msg") as HTMLInputElement).value || "honk";
@@ -256,23 +402,18 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
       return;
     }
     void (async () => {
-      // Ensure node knows peer HTTP RPCs so server-side fanout works.
-      let i = 0;
-      for (const peer of peerList()) {
-        i += 1;
-        try {
-          await client.addPeer(`peer${i}`, peer, { rpc: peer });
-        } catch {
-          /* already added */
-        }
-      }
+      await ensurePeers();
       const s = await client.send(roomId, text);
       const fo = s.fanout_ok ?? 0;
       const fp = s.fanout_peers ?? 0;
       log(`sent ${s.event_id.slice(0, 12)}… fanout ${fo}/${fp}`);
       if (s.fanout_errors?.length) log(`fanout errs: ${s.fanout_errors.join("; ")}`);
       const msgs = await client.listMessages(roomId);
-      log(JSON.stringify(msgs.messages, null, 2));
+      renderMessages(msgs.messages);
+      if (liveEnabled) startLive();
     })();
   });
+
+  setLiveLabel();
+  if (liveEnabled && roomInput.value.trim()) startLive();
 }
