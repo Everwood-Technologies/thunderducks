@@ -28,9 +28,10 @@ use td_event::{
     sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
 use td_net::{
-    accept_once, dial, noise_read_event, read_event, write_event, NoiseTcpStream, PeerUri,
-    RelayClient, RelayEnvelope,
+    accept_once, dial, noise_read_event, quic_accept, quic_listen, read_event, write_event,
+    NoiseTcpStream, PeerUri, RelayClient, RelayEnvelope,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
@@ -57,6 +58,14 @@ pub struct ServeOptions {
     pub rate_limit: bool,
     /// Prefer Noise_XX for P2P accept/dial when peer URI uses td-noise:// or flag set.
     pub p2p_noise: bool,
+    /// Prefer QUIC P2P (`td-quic://`); takes advertise precedence over noise.
+    pub p2p_quic: bool,
+    /// TLS cert PEM path for in-process HTTPS RPC (`TD_TLS_CERT`).
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key PEM path (`TD_TLS_KEY`).
+    pub tls_key: Option<PathBuf>,
+    /// Generate ephemeral self-signed cert when no cert/key (dev only).
+    pub tls_self_signed: bool,
 }
 
 impl ServeOptions {
@@ -98,6 +107,20 @@ impl ServeOptions {
                 !(v == "0" || v == "false" || v == "off" || v == "no")
             })
             .unwrap_or(false);
+        let p2p_quic = std::env::var("TD_P2P_QUIC")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false);
+        let tls_cert = std::env::var_os("TD_TLS_CERT").map(PathBuf::from);
+        let tls_key = std::env::var_os("TD_TLS_KEY").map(PathBuf::from);
+        let tls_self_signed = std::env::var("TD_TLS_SELF_SIGNED")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false);
         Self {
             data_dir,
             p2p_bind,
@@ -107,6 +130,10 @@ impl ServeOptions {
             require_owner_non_loopback,
             rate_limit,
             p2p_noise,
+            p2p_quic,
+            tls_cert,
+            tls_key,
+            tls_self_signed,
         }
     }
 }
@@ -122,6 +149,10 @@ impl Default for ServeOptions {
             require_owner_non_loopback: true,
             rate_limit: true,
             p2p_noise: false,
+            p2p_quic: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_self_signed: false,
         }
     }
 }
@@ -149,14 +180,26 @@ fn advertise_addr(local: SocketAddr, advertise_host: Option<&str>) -> String {
     local.to_string()
 }
 
-fn advertise_http_base(local: SocketAddr, advertise_host: Option<&str>) -> String {
-    format!("http://{}", advertise_addr(local, advertise_host))
+fn advertise_http_base(local: SocketAddr, advertise_host: Option<&str>, https: bool) -> String {
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{}", advertise_addr(local, advertise_host))
 }
 
-fn advertise_p2p_uri(local: SocketAddr, advertise_host: Option<&str>, noise: bool) -> String {
+fn advertise_p2p_uri(
+    local: SocketAddr,
+    advertise_host: Option<&str>,
+    noise: bool,
+    quic: bool,
+) -> String {
     let adv = advertise_addr(local, advertise_host);
-    let scheme = if noise { "td-noise" } else { "td" };
-    if adv.starts_with("td://") || adv.starts_with("td-noise://") {
+    let scheme = if quic {
+        "td-quic"
+    } else if noise {
+        "td-noise"
+    } else {
+        "td"
+    };
+    if adv.starts_with("td://") || adv.starts_with("td-noise://") || adv.starts_with("td-quic://") {
         adv
     } else {
         format!("{scheme}://{adv}")
@@ -369,6 +412,10 @@ struct NodeSession {
     relay_key: [u8; 32],
     /// Prefer Noise for P2P.
     p2p_noise: bool,
+    /// Prefer QUIC for P2P.
+    p2p_quic: bool,
+    /// RPC served over HTTPS.
+    rpc_tls: bool,
     /// Last relay poll summary (best-effort).
     relay_last_fetch_ms: Option<u64>,
     relay_last_error: Option<String>,
@@ -412,6 +459,8 @@ impl NodeSession {
             relay_uri: None,
             relay_key: td_crypto::derive_relay_key(td_crypto::DEFAULT_RELAY_KEY_MATERIAL),
             p2p_noise: false,
+            p2p_quic: false,
+            rpc_tls: false,
             relay_last_fetch_ms: None,
             relay_last_error: None,
             relay_last_fetched: 0,
@@ -427,6 +476,7 @@ impl NodeSession {
         }
         self.relay_key = opts.relay_key;
         self.p2p_noise = opts.p2p_noise;
+        self.p2p_quic = opts.p2p_quic;
     }
 
     fn load_from_data_dir(dir: NodeDataDir) -> Result<Self, String> {
@@ -2764,6 +2814,8 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
         "require_owner": st.require_owner,
         "rate_limit": st.rate_limit_enabled,
         "p2p_noise": g.p2p_noise,
+        "p2p_quic": g.p2p_quic,
+        "rpc_tls": g.rpc_tls,
         "relay_seal": "olm-v2+aead-v1",
         "peers": g.peers.values().collect::<Vec<_>>(),
     }))
@@ -3691,13 +3743,48 @@ async fn start_p2p_listener(
     p2p_bind: &str,
     advertise_host: Option<&str>,
 ) -> Result<String, std::io::Error> {
+    let (noise, quic) = {
+        let g = state.inner.lock().await;
+        (g.p2p_noise, g.p2p_quic)
+    };
+
+    if quic {
+        let (endpoint, addr) = quic_listen(p2p_bind)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let uri = advertise_p2p_uri(addr, advertise_host, false, true);
+        {
+            let mut g = state.inner.lock().await;
+            g.p2p_uri = Some(uri.clone());
+        }
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut stream = match quic_accept(&endpoint).await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let st2 = st.clone();
+                tokio::spawn(async move {
+                    while let Ok(ev) = stream.read_event().await {
+                        let room_id = ev.room_id;
+                        let inserted = {
+                            let mut g = st2.inner.lock().await;
+                            g.ingest_remote(ev).unwrap_or(false)
+                        };
+                        if inserted {
+                            notify_room_from_id(&st2, &room_id).await;
+                        }
+                    }
+                });
+            }
+        });
+        return Ok(uri);
+    }
+
     let listener = TcpListener::bind(p2p_bind).await?;
     let addr = listener.local_addr()?;
-    let noise = {
-        let g = state.inner.lock().await;
-        g.p2p_noise
-    };
-    let uri = advertise_p2p_uri(addr, advertise_host, noise);
+    let uri = advertise_p2p_uri(addr, advertise_host, noise, false);
     {
         let mut g = state.inner.lock().await;
         g.p2p_uri = Some(uri.clone());
@@ -3872,6 +3959,66 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
     Ok(n)
 }
 
+
+fn ensure_rustls_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Load rustls config from PEM files or generate ephemeral self-signed.
+async fn load_tls_config(
+    cert: Option<&PathBuf>,
+    key: Option<&PathBuf>,
+    self_signed: bool,
+) -> Result<Option<RustlsConfig>, std::io::Error> {
+    ensure_rustls_provider();
+    match (cert, key) {
+        (Some(c), Some(k)) => {
+            let cfg = RustlsConfig::from_pem_file(c, k)
+                .await
+                .map_err(|e| std::io::Error::other(format!("tls cert/key: {e}")))?;
+            Ok(Some(cfg))
+        }
+        (None, None) if self_signed => {
+            let (certs, key_der) = generate_self_signed_rpc_cert()
+                .map_err(|e| std::io::Error::other(format!("self-signed tls: {e}")))?;
+            let cfg = RustlsConfig::from_der(certs, key_der)
+                .await
+                .map_err(|e| std::io::Error::other(format!("tls der: {e}")))?;
+            Ok(Some(cfg))
+        }
+        (None, None) => Ok(None),
+        _ => Err(std::io::Error::other(
+            "both TD_TLS_CERT and TD_TLS_KEY required (or TD_TLS_SELF_SIGNED=true)",
+        )),
+    }
+}
+
+fn generate_self_signed_rpc_cert() -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    ensure_rustls_provider();
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    let key_pair = KeyPair::generate().map_err(|e| e.to_string())?;
+    let mut params = CertificateParams::new(vec!["localhost".into(), "td-pond".into()])
+        .map_err(|e| e.to_string())?;
+    params.subject_alt_names.push(
+        SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|e: rcgen::Error| e.to_string())?,
+        ),
+    );
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
+    Ok((vec![cert.der().to_vec()], key_pair.serialize_der()))
+}
+
 /// Serve RPC on `bind` (e.g. 127.0.0.1:8788). Returns local addr after bind.
 /// In-memory only (tests / smoke). Prefer `serve_with_options` for Pond.
 pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
@@ -3898,15 +4045,16 @@ pub async fn serve_with_options(
     bind: &str,
     opts: ServeOptions,
 ) -> Result<SocketAddr, std::io::Error> {
-    let (state, p2p, listener, addr) = prepare_serve(bind, opts).await?;
-    let app = router(state);
-    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
+    let prepared = prepare_serve(bind, opts).await?;
+    let scheme = if prepared.tls.is_some() { "https" } else { "http" };
+    eprintln!(
+        "td-node rpc listening on {scheme}://{} p2p={}",
+        prepared.addr, prepared.p2p
+    );
+    let app = router(prepared.state);
+    let addr = prepared.addr;
     tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await;
+        let _ = run_rpc_server(prepared.listener, prepared.tls, app).await;
     });
     Ok(addr)
 }
@@ -3936,9 +4084,9 @@ pub async fn serve_blocking_with_options(
     bind: &str,
     opts: ServeOptions,
 ) -> Result<(), std::io::Error> {
-    let (state, p2p, listener, addr) = prepare_serve(bind, opts).await?;
+    let prepared = prepare_serve(bind, opts).await?;
     let notes = {
-        let g = state.inner.lock().await;
+        let g = prepared.state.inner.lock().await;
         let data = g
             .data_dir
             .as_ref()
@@ -3954,43 +4102,89 @@ pub async fn serve_blocking_with_options(
             .as_ref()
             .map(|h| format!(" advertise={h}"))
             .unwrap_or_default();
-        let own = if state.require_owner {
+        let own = if prepared.state.require_owner {
             " owner_gate=on"
         } else {
             " owner_gate=off"
         };
-        format!("{data}{relay}{adv}{own}")
+        let tls = if g.rpc_tls { " tls=on" } else { " tls=off" };
+        let p2p_mode = if g.p2p_quic {
+            " p2p=quic"
+        } else if g.p2p_noise {
+            " p2p=noise"
+        } else {
+            " p2p=tcp"
+        };
+        format!("{data}{relay}{adv}{own}{tls}{p2p_mode}")
     };
-    let app = router(state);
-    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}{notes}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    let scheme = if prepared.tls.is_some() { "https" } else { "http" };
+    eprintln!(
+        "td-node rpc listening on {scheme}://{} p2p={}{notes}",
+        prepared.addr, prepared.p2p
+    );
+    let app = router(prepared.state);
+    run_rpc_server(prepared.listener, prepared.tls, app).await
 }
 
-async fn prepare_serve(
-    bind: &str,
-    opts: ServeOptions,
-) -> Result<(RpcState, String, tokio::net::TcpListener, SocketAddr), std::io::Error> {
+struct PreparedServe {
+    state: RpcState,
+    p2p: String,
+    listener: tokio::net::TcpListener,
+    addr: SocketAddr,
+    tls: Option<RustlsConfig>,
+}
+
+async fn run_rpc_server(
+    listener: tokio::net::TcpListener,
+    tls: Option<RustlsConfig>,
+    app: axum::Router,
+) -> Result<(), std::io::Error> {
+    let make = app.into_make_service_with_connect_info::<SocketAddr>();
+    match tls {
+        Some(cfg) => {
+            let std_listener = listener.into_std()?;
+            std_listener.set_nonblocking(true)?;
+            axum_server::from_tcp_rustls(std_listener, cfg)
+                .serve(make)
+                .await
+        }
+        None => axum::serve(listener, make).await,
+    }
+}
+
+async fn prepare_serve(bind: &str, opts: ServeOptions) -> Result<PreparedServe, std::io::Error> {
     let require_owner = opts.require_owner_non_loopback && !is_loopback_bind(bind);
     let advertise = opts.advertise_host.clone();
     let p2p_bind = opts
         .p2p_bind
         .clone()
         .unwrap_or_else(|| "127.0.0.1:0".into());
+    let tls_cert = opts.tls_cert.clone();
+    let tls_key = opts.tls_key.clone();
+    let tls_self_signed = opts.tls_self_signed;
     let mut state = new_state_with_options(opts).map_err(std::io::Error::other)?;
     state.require_owner = require_owner;
+    let tls = load_tls_config(tls_cert.as_ref(), tls_key.as_ref(), tls_self_signed).await?;
+    let https = tls.is_some();
+    {
+        let mut g = state.inner.lock().await;
+        g.rpc_tls = https;
+    }
     let p2p = start_p2p_listener(state.clone(), &p2p_bind, advertise.as_deref()).await?;
     spawn_relay_poller(state.clone());
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     {
         let mut g = state.inner.lock().await;
-        g.rpc_base = Some(advertise_http_base(addr, advertise.as_deref()));
+        g.rpc_base = Some(advertise_http_base(addr, advertise.as_deref(), https));
     }
-    Ok((state, p2p, listener, addr))
+    Ok(PreparedServe {
+        state,
+        p2p,
+        listener,
+        addr,
+        tls,
+    })
 }
 
 /// Happy-path in-process exercise used by CLI tests and CI.

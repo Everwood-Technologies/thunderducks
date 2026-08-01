@@ -157,7 +157,7 @@ Pair tokens remain short-lived and in-memory by design.
 **Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + AEAD relay + optional Noise).
 
 **Appliance:** OTA auto-apply + Wi‑Fi — [`ota-wifi.md`](./ota-wifi.md) (`tducks-ota-apply.path`).  
-**Transport / seal:** Noise_XX + ChaCha20-Poly1305 relay seal — [`remote-access.md`](./remote-access.md).
+**Transport / seal:** Noise_XX + QUIC P2P, in-process HTTPS RPC, Olm/AEAD relay seal — [`remote-access.md`](./remote-access.md).
 
 ## Security notes
 

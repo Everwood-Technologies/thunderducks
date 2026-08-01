@@ -20,17 +20,21 @@ pub struct PeerUri {
     pub port: u16,
     /// When true, dial/accept should use Noise_XX transport.
     pub noise: bool,
+    /// When true, dial/accept should use QUIC (`td-quic://`).
+    pub quic: bool,
 }
 
 impl PeerUri {
     pub fn parse(s: &str) -> Result<Self, PeerError> {
-        // td://host:port | td-noise://host:port | host:port
-        let (rest, noise) = if let Some(r) = s.strip_prefix("td-noise://") {
-            (r, true)
+        // td://host:port | td-noise://host:port | td-quic://host:port | host:port
+        let (rest, noise, quic) = if let Some(r) = s.strip_prefix("td-quic://") {
+            (r, false, true)
+        } else if let Some(r) = s.strip_prefix("td-noise://") {
+            (r, true, false)
         } else if let Some(r) = s.strip_prefix("td://") {
-            (r, false)
+            (r, false, false)
         } else {
-            (s, false)
+            (s, false, false)
         };
         let (host, port_s) = rest
             .rsplit_once(':')
@@ -42,6 +46,7 @@ impl PeerUri {
             host: host.to_string(),
             port,
             noise,
+            quic,
         })
     }
 
@@ -50,6 +55,7 @@ impl PeerUri {
             host: addr.ip().to_string(),
             port: addr.port(),
             noise: false,
+            quic: false,
         }
     }
 
@@ -58,11 +64,23 @@ impl PeerUri {
             host: addr.ip().to_string(),
             port: addr.port(),
             noise: true,
+            quic: false,
+        }
+    }
+
+    pub fn from_tcp_addr_quic(addr: SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            noise: false,
+            quic: true,
         }
     }
 
     pub fn to_string_uri(&self) -> String {
-        if self.noise {
+        if self.quic {
+            format!("td-quic://{}:{}", self.host, self.port)
+        } else if self.noise {
             format!("td-noise://{}:{}", self.host, self.port)
         } else {
             format!("td://{}:{}", self.host, self.port)

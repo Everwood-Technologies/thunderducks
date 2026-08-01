@@ -33,10 +33,11 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Status |
 |----|------|--------|
-| P3.1 | QUIC transport (TCP framed is MVP fallback) | open (Noise_XX TCP done) |
+| P3.1 | **QUIC transport** (`td-quic://`, `TD_P2P_QUIC`) | ✅ done |
 | P3.1b | **Noise_XX transport** (`td-noise://`, `TD_P2P_NOISE`) | ✅ done |
 | P3.1c | **Production relay seal** (ChaCha20-Poly1305 / `TD_RELAY_KEY`) | ✅ done |
 | P3.1d | **Per-recipient Olm relay wrap** (v2; AEAD v1 fallback) | ✅ done |
+| P3.1e | **In-process HTTPS RPC** (`TD_TLS_CERT`/`KEY` / self-signed) | ✅ done |
 | P3.2 | **SSE live message push** (`GET /v1/messages/stream`; WS later) | ✅ done (A2) |
 | P3.2b | **Shared room Megolm ownership** (one outbound session/room) | ✅ done (B2) |
 | P3.2c | **Pond packaging** (linux amd64/arm64 release + systemd DIY install) | ✅ done (C) |

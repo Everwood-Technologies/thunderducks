@@ -30,6 +30,10 @@ Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner
 | `TD_RELAY_URI` / `--relay-uri` | Assist relay `td://host:port` or `td-noise://host:port` |
 | `TD_RELAY_KEY` / `--relay-key` | Fallback shared AEAD key (v1) when Olm session missing; UTF-8 or 64-hex → blake3 |
 | `TD_P2P_NOISE` / `--p2p-noise` | Advertise `td-noise://` + Noise_XX on P2P accept (default **false**) |
+| `TD_P2P_QUIC` / `--p2p-quic` | Advertise `td-quic://` + QUIC accept (default **false**; takes precedence over noise) |
+| `TD_TLS_CERT` / `--tls-cert` | PEM cert for **in-process HTTPS** RPC |
+| `TD_TLS_KEY` / `--tls-key` | PEM private key for HTTPS RPC |
+| `TD_TLS_SELF_SIGNED` / `--tls-self-signed` | Ephemeral self-signed HTTPS (dev only; default **false**) |
 | `TD_REQUIRE_OWNER` / `--require-owner` | When bind is **non-loopback**, require owner session for **non-public** routes (default **true**) |
 | `TD_RATE_LIMIT` / `--rate-limit` | Per-IP sliding-window rate limits (default **true**) |
 
@@ -40,7 +44,9 @@ export TD_ADVERTISE_HOST=100.x.y.z
 export TD_P2P_BIND=0.0.0.0:0
 export TD_RELAY_URI=td://relay.example:7700
 export TD_RELAY_KEY='long-random-shared-secret'
-# optional: TD_P2P_NOISE=true
+# optional: TD_P2P_NOISE=true  or  TD_P2P_QUIC=true
+# optional HTTPS: TD_TLS_CERT=/etc/ssl/pond.crt TD_TLS_KEY=/etc/ssl/pond.key
+# dev only: TD_TLS_SELF_SIGNED=true
 tducks serve --bind 127.0.0.1:8788 --data-dir "$TD_DATA_DIR"
 ```
 
@@ -88,7 +94,7 @@ Auth: `Authorization: Bearer <owner_token>` or `x-td-owner-token`. SSE may pass 
 
 Exceeding → `429` + `Retry-After`. Toggle with `TD_RATE_LIMIT=false` for local load tests only.
 
-P2P/relay can use **Noise_XX** (`td-noise://` / `TD_P2P_NOISE`). Keep RPC bind private (tailnet/LAN); HTTP RPC is still not TLS-terminated in-process.
+P2P can use **Noise_XX** (`td-noise://`) or **QUIC** (`td-quic://` / `TD_P2P_QUIC`). RPC supports **in-process HTTPS** (`TD_TLS_CERT`+`TD_TLS_KEY` or `TD_TLS_SELF_SIGNED`). Keep bind private (tailnet/LAN) even with TLS.
 
 ## Tailnet recipe (recommended)
 
@@ -112,7 +118,7 @@ export TD_RELAY_URI=td://relay.example.com:7700
 Honest limits:
 
 - Relay never sees room plaintext API. Preferred device-side seal is **Olm per-recipient (v2)** after `POST /v1/e2ee/trust-keys` (or share-session which caches keys). Shared-key AEAD (`TD_RELAY_KEY`, v1) is fallback only when no Olm session exists.
-- Noise_XX available for P2P; QUIC still later. HTTP RPC TLS is terminate-at-proxy / tailscale serve.
+- Noise_XX and QUIC available for P2P; HTTPS RPC in-process (or still terminate-at-proxy / Tailscale serve).
 - Pair links still embed RPC base; use advertise host + recovery unlock on the client.
 - OTA / Wi‑Fi: see [`ota-wifi.md`](./ota-wifi.md).
 

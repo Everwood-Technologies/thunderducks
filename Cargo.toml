@@ -49,6 +49,11 @@ sha2 = "0.10"
 chacha20poly1305 = "0.10"
 aead = { version = "0.5", features = ["std"] }
 snow = "0.9"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+quinn = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

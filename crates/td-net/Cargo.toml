@@ -21,6 +21,9 @@ blake3 = { workspace = true }
 snow = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 td-crypto = { workspace = true }

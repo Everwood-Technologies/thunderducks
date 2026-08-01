@@ -46,6 +46,18 @@ enum Commands {
         /// Prefer Noise_XX for P2P (advertise td-noise:// and handshake on accept).
         #[arg(long, env = "TD_P2P_NOISE", default_value_t = false)]
         p2p_noise: bool,
+        /// Prefer QUIC P2P (advertise td-quic://).
+        #[arg(long, env = "TD_P2P_QUIC", default_value_t = false)]
+        p2p_quic: bool,
+        /// TLS cert PEM for in-process HTTPS RPC.
+        #[arg(long, env = "TD_TLS_CERT")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// TLS private key PEM for in-process HTTPS RPC.
+        #[arg(long, env = "TD_TLS_KEY")]
+        tls_key: Option<std::path::PathBuf>,
+        /// Ephemeral self-signed TLS (dev only).
+        #[arg(long, env = "TD_TLS_SELF_SIGNED", default_value_t = false)]
+        tls_self_signed: bool,
         /// Require owner session for non-public routes when bind is non-loopback (default true).
         #[arg(long, env = "TD_REQUIRE_OWNER", default_value_t = true)]
         require_owner: bool,
@@ -102,6 +114,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             relay_uri,
             relay_key,
             p2p_noise,
+            p2p_quic,
+            tls_cert,
+            tls_key,
+            tls_self_signed,
             require_owner,
             rate_limit,
         } => {
@@ -124,6 +140,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                 opts.relay_key = td_crypto::derive_relay_key(&material);
             }
             opts.p2p_noise = p2p_noise;
+            opts.p2p_quic = p2p_quic;
+            if tls_cert.is_some() {
+                opts.tls_cert = tls_cert;
+            }
+            if tls_key.is_some() {
+                opts.tls_key = tls_key;
+            }
+            opts.tls_self_signed = tls_self_signed;
             opts.require_owner_non_loopback = require_owner;
             opts.rate_limit = rate_limit;
             td_node::serve_blocking_with_options(&bind, opts)

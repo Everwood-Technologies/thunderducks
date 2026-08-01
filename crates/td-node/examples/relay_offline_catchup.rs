@@ -111,6 +111,7 @@ fn spawn_relay_binary() -> Result<RelayProc, Box<dyn std::error::Error>> {
         host: "127.0.0.1".into(),
         port,
         noise: false,
+        quic: false,
     };
     Ok(RelayProc { child, uri, db })
 }

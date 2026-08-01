@@ -1,12 +1,14 @@
 //! Framed P2P event exchange + opaque relay assist protocol (Waves B3 + D1).
 //!
-//! Transport: optional **Noise_XX** (`td-noise://` / `noise=1`) over TCP; plain
-//! length-prefixed JSON remains the default for localhost/DIY.
-//! QUIC still later.
+//! Transport:
+//! - plain TCP length-prefixed JSON (`td://`) — default localhost/DIY
+//! - **Noise_XX** over TCP (`td-noise://`)
+//! - **QUIC** (`td-quic://`) first slice with self-signed TLS
 
 mod frame;
 mod noise;
 mod peer;
+mod quic;
 mod relay_client;
 mod relay_proto;
 
@@ -16,6 +18,9 @@ pub use noise::{
     NoiseTcpStream,
 };
 pub use peer::{accept_once, dial, serve_exchange, PeerError, PeerUri};
+pub use quic::{
+    is_quic_uri, quic_accept, quic_dial, quic_listen, QuicError, QuicStream,
+};
 pub use relay_client::{RelayClient, RelayClientError};
 pub use relay_proto::{
     read_json, write_json, RelayEnvelope, RelayProtoError, RelayRequest, RelayResponse,
