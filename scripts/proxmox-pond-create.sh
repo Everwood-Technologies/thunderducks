@@ -20,7 +20,7 @@
 #   scripts/pond-guest-bootstrap.sh  (tducks alpha + nginx UI)
 #
 # Env defaults (overridable):
-#   TDUCKS_VERSION=v0.1.0-alpha.1
+#   TDUCKS_VERSION=v0.1.0-alpha.2
 #   POND_PASSWORD=pond1  (root/ubuntu password; Proxmox requires >= 5 chars)
 #   POND_SSH_KEY=        (path to pubkey; optional)
 #   POND_MEMORY_MB=2048  POND_CORES=2  POND_DISK_GB=16
@@ -39,7 +39,7 @@ CORES="${POND_CORES:-2}"
 DISK_GB="${POND_DISK_GB:-16}"
 PASSWORD="${POND_PASSWORD:-pond1}"
 SSH_KEY="${POND_SSH_KEY:-}"
-VERSION="${TDUCKS_VERSION:-v0.1.0-alpha.1}"
+VERSION="${TDUCKS_VERSION:-v0.1.0-alpha.2}"
 REPO="${TDUCKS_REPO:-Everwood-Technologies/thunderducks}"
 WEB_REF="${POND_WEB_REF:-main}"
 START=1

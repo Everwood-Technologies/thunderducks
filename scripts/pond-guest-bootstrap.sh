@@ -4,7 +4,7 @@
 # Run as root inside the VM/LXC (or via pct/qm guest exec from the PVE helper).
 #
 # Env:
-#   TDUCKS_VERSION=v0.1.0-alpha.1   (required for prereleases; default alpha.1)
+#   TDUCKS_VERSION=v0.1.0-alpha.2   (required for prereleases; default alpha.2)
 #   TDUCKS_REPO=Everwood-Technologies/thunderducks
 #   POND_WEB_REF=main               (git ref for clients/web + nginx conf)
 #   POND_SKIP_NGINX=0
@@ -18,7 +18,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 REPO="${TDUCKS_REPO:-Everwood-Technologies/thunderducks}"
-VERSION="${TDUCKS_VERSION:-v0.1.0-alpha.1}"
+VERSION="${TDUCKS_VERSION:-v0.1.0-alpha.2}"
 WEB_REF="${POND_WEB_REF:-main}"
 SKIP_NGINX="${POND_SKIP_NGINX:-0}"
 SKIP_TDUCKS="${POND_SKIP_TDUCKS:-0}"
