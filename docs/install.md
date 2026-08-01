@@ -54,16 +54,19 @@ sudo systemctl restart tducks
 
 ### Bind address
 
-Default is loopback (safe). For LAN clients (Pond-like):
+Default is loopback (safe). For LAN / tailnet clients see **[`remote-access.md`](./remote-access.md)**.
 
 ```bash
-# /etc/thunderducks/tducks.env
-TD_BIND=0.0.0.0:8788
+# /etc/thunderducks/tducks.env — prefer tailnet advertise + loopback RPC
+TD_ADVERTISE_HOST=100.x.y.z
+TD_P2P_BIND=0.0.0.0:0
+# only if you must bind RPC on a private NIC:
+# TD_BIND=0.0.0.0:8788   # enables owner_gate for admin routes
 ```
 
 ```bash
 sudo systemctl restart tducks
-# firewall: allow only trusted LAN — do not expose admin RPC to WAN
+# firewall: allow only trusted LAN/tailnet — do not expose admin RPC to WAN
 ```
 
 ## Release artifacts
@@ -151,10 +154,13 @@ Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
 
 Pair tokens remain short-lived and in-memory by design.
 
-**Still later Pond phases:** full RPC authn (not just pair mint), OTA, Wi‑Fi wizard, tailnet/relay UX.
+**Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + optional relay; owner gate off-loopback).
+
+**Still later Pond phases:** full RPC authn, production relay seal, OTA, Wi‑Fi wizard.
 
 ## Security notes
 
 - DIY default: RPC on **localhost only**
+- Non-loopback bind → owner session required for admin mutations (pair/peers/link/relay)
 - Service runs as unprivileged `tducks` with systemd hardening flags
-- Do **not** publish `:8788` to the public internet without authn (still open backlog item)
+- Do **not** publish `:8788` to the public internet

@@ -64,7 +64,8 @@ sudo ./scripts/install-tducks.sh --from-file ./target/release/tducks
 # curl -fsSL .../scripts/install-tducks.sh | sudo bash
 ```
 
-Appliance product draft: [`docs/pond-appliance.md`](./docs/pond-appliance.md).
+Appliance product draft: [`docs/pond-appliance.md`](./docs/pond-appliance.md).  
+Remote access (tailnet + relay): [`docs/remote-access.md`](./docs/remote-access.md).
 
 ## Dev harness
 

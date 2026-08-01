@@ -26,11 +26,23 @@ enum Commands {
     HappyPath,
     /// Start local node RPC server (blocks)
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8788")]
+        #[arg(long, default_value = "127.0.0.1:8788", env = "TD_BIND")]
         bind: String,
         /// Durable data dir (identity.key + claim.json). Falls back to $TD_DATA_DIR.
         #[arg(long, env = "TD_DATA_DIR")]
         data_dir: Option<std::path::PathBuf>,
+        /// P2P listen bind (default 127.0.0.1:0). Use 0.0.0.0:0 for LAN/tailnet peers.
+        #[arg(long, env = "TD_P2P_BIND")]
+        p2p_bind: Option<String>,
+        /// Host/IP advertised in rpc_base + p2p_uri (Tailscale IP or DNS).
+        #[arg(long, env = "TD_ADVERTISE_HOST")]
+        advertise_host: Option<String>,
+        /// Untrusted assist relay URI (td://host:port).
+        #[arg(long, env = "TD_RELAY_URI")]
+        relay_uri: Option<String>,
+        /// Require owner session for admin routes when bind is non-loopback (default true).
+        #[arg(long, env = "TD_REQUIRE_OWNER", default_value_t = true)]
+        require_owner: bool,
     },
     /// Show node status
     Status,
@@ -73,15 +85,32 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("{out}");
             Ok(())
         }
-        Commands::Serve { bind, data_dir } => {
-            match data_dir {
-                Some(dir) => td_node::serve_blocking_with_data_dir(&bind, dir)
-                    .await
-                    .map_err(|e| e.to_string())?,
-                None => td_node::serve_blocking(&bind)
-                    .await
-                    .map_err(|e| e.to_string())?,
+        Commands::Serve {
+            bind,
+            data_dir,
+            p2p_bind,
+            advertise_host,
+            relay_uri,
+            require_owner,
+        } => {
+            let mut opts = td_node::ServeOptions::from_env();
+            // CLI flags override env defaults when present.
+            if data_dir.is_some() {
+                opts.data_dir = data_dir;
             }
+            if p2p_bind.is_some() {
+                opts.p2p_bind = p2p_bind;
+            }
+            if advertise_host.is_some() {
+                opts.advertise_host = advertise_host;
+            }
+            if relay_uri.is_some() {
+                opts.relay_uri = relay_uri;
+            }
+            opts.require_owner_non_loopback = require_owner;
+            td_node::serve_blocking_with_options(&bind, opts)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
         Commands::Status => {

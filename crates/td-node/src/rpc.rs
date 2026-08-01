@@ -1,6 +1,7 @@
 //! Local node HTTP RPC for CLI + TS web (Wave E).
 //!
-//! Binds localhost only. In-memory single-device session for MVP smoke.
+//! Default bind is loopback. Non-loopback requires owner session for admin routes.
+//! Optional untrusted assist relay + advertised host for tailnet/LAN remote access.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -11,7 +12,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::RngCore;
@@ -20,15 +22,104 @@ use td_crypto::{
     PasskeyRegistry, RoomOutboundPackage,
 };
 use td_event::{
-    sign_event, DeviceId, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
+    sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
-use td_net::{accept_once, dial, read_event, write_event, PeerUri};
+use td_net::{
+    accept_once, dial, read_event, write_event, PeerUri, RelayClient, RelayEnvelope,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::persist::NodeDataDir;
 use crate::sync::{DeviceNode, SyncOffer};
+
+/// Runtime options for serving a Pond node (local or remote-capable).
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions {
+    /// Durable identity + claim directory.
+    pub data_dir: Option<PathBuf>,
+    /// P2P listen bind (default `127.0.0.1:0`). Use `0.0.0.0:0` or LAN/tailnet IP for remote peers.
+    pub p2p_bind: Option<String>,
+    /// Host/IP advertised in `p2p_uri` / `rpc_base` (e.g. Tailscale IP or DNS name).
+    pub advertise_host: Option<String>,
+    /// Optional untrusted assist relay URI (`td://host:port`).
+    pub relay_uri: Option<String>,
+    /// XOR pad for MVP relay seal (demo-grade; not production E2EE-at-rest).
+    pub relay_pad: u8,
+    /// When RPC is not loopback-only, require owner session for admin routes.
+    pub require_owner_non_loopback: bool,
+}
+
+impl ServeOptions {
+    pub fn from_env() -> Self {
+        let data_dir = std::env::var_os("TD_DATA_DIR").map(PathBuf::from);
+        let p2p_bind = std::env::var("TD_P2P_BIND").ok().filter(|s| !s.trim().is_empty());
+        let advertise_host = std::env::var("TD_ADVERTISE_HOST")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let relay_uri = std::env::var("TD_RELAY_URI")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let relay_pad = std::env::var("TD_RELAY_PAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x3C);
+        // Default on: safer when binding non-loopback.
+        let require_owner_non_loopback = std::env::var("TD_REQUIRE_OWNER")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
+        Self {
+            data_dir,
+            p2p_bind,
+            advertise_host,
+            relay_uri,
+            relay_pad,
+            require_owner_non_loopback,
+        }
+    }
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+        || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+fn advertise_addr(local: SocketAddr, advertise_host: Option<&str>) -> String {
+    if let Some(h) = advertise_host.map(str::trim).filter(|s| !s.is_empty()) {
+        // host may be DNS or IP; keep port from actual bind
+        if h.contains(':') && !h.starts_with('[') {
+            // already host:port or ipv6 without brackets — use as-is if it looks complete
+            if h.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).is_some()
+                && h.matches(':').count() == 1
+            {
+                return h.to_string();
+            }
+        }
+        return format!("{h}:{}", local.port());
+    }
+    local.to_string()
+}
+
+fn advertise_http_base(local: SocketAddr, advertise_host: Option<&str>) -> String {
+    format!("http://{}", advertise_addr(local, advertise_host))
+}
+
+fn advertise_p2p_uri(local: SocketAddr, advertise_host: Option<&str>) -> String {
+    let adv = advertise_addr(local, advertise_host);
+    if adv.starts_with("td://") {
+        adv
+    } else {
+        format!("td://{adv}")
+    }
+}
 
 /// Room-scoped change signal for wait long-poll + SSE.
 #[derive(Debug, Clone)]
@@ -71,6 +162,8 @@ impl RoomNotify {
 pub struct RpcState {
     inner: Arc<Mutex<NodeSession>>,
     notify: Arc<RoomNotify>,
+    /// When true, admin routes require owner session (set when RPC bind is non-loopback).
+    require_owner: bool,
 }
 
 /// Known peer endpoints. HTTP RPC = reliable share+delta; P2P = best-effort.
@@ -110,6 +203,16 @@ struct NodeSession {
     recovery_lock_until: Option<Instant>,
     /// Optional durable store (identity + claim). None = pure in-memory.
     data_dir: Option<NodeDataDir>,
+    /// Advertised public/tailnet host for URI rewriting.
+    advertise_host: Option<String>,
+    /// Configured untrusted assist relay (`td://…`).
+    relay_uri: Option<String>,
+    /// MVP relay seal pad.
+    relay_pad: u8,
+    /// Last relay poll summary (best-effort).
+    relay_last_fetch_ms: Option<u64>,
+    relay_last_error: Option<String>,
+    relay_last_fetched: u32,
 }
 
 impl NodeSession {
@@ -144,7 +247,23 @@ impl NodeSession {
             recovery_failures: 0,
             recovery_lock_until: None,
             data_dir,
+            advertise_host: None,
+            relay_uri: None,
+            relay_pad: 0x3C,
+            relay_last_fetch_ms: None,
+            relay_last_error: None,
+            relay_last_fetched: 0,
         }
+    }
+
+    fn apply_remote_opts(&mut self, opts: &ServeOptions) {
+        if let Some(h) = opts.advertise_host.clone() {
+            self.advertise_host = Some(h);
+        }
+        if let Some(r) = opts.relay_uri.clone() {
+            self.relay_uri = Some(r);
+        }
+        self.relay_pad = opts.relay_pad;
     }
 
     fn load_from_data_dir(dir: NodeDataDir) -> Result<Self, String> {
@@ -315,6 +434,13 @@ pub struct StatusResponse {
     pub passkey_credentials: usize,
     pub e2ee_default: bool,
     pub p2p_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_uri: Option<String>,
+    pub require_owner: bool,
     pub claimed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -577,6 +703,10 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         passkey_credentials: g.passkeys.credential_count(),
         e2ee_default: true,
         p2p_uri: g.p2p_uri.clone(),
+        rpc_base: g.rpc_base.clone(),
+        advertise_host: g.advertise_host.clone(),
+        relay_uri: g.relay_uri.clone(),
+        require_owner: st.require_owner,
         claimed: g.claim.claimed,
         display_name: g.claim.display_name.clone(),
         claimed_at_ms: g.claim.claimed_at_ms,
@@ -675,6 +805,19 @@ fn require_owner(
         ));
     }
     Ok(())
+}
+
+/// When node is in remote/non-loopback mode, require owner for admin mutations.
+fn require_owner_if_remote(
+    st: &RpcState,
+    g: &mut NodeSession,
+    headers: &HeaderMap,
+) -> Result<(), Box<axum::response::Response>> {
+    if st.require_owner {
+        require_owner(g, headers)
+    } else {
+        Ok(())
+    }
 }
 
 async fn claim_status(State(st): State<RpcState>) -> impl IntoResponse {
@@ -1522,9 +1665,13 @@ async fn stream_messages(
 
 async fn add_peer(
     State(st): State<RpcState>,
+    headers: HeaderMap,
     Json(req): Json<AddPeerRequest>,
 ) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
+    if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+        return *resp;
+    }
     let uri = req.uri.clone().unwrap_or_default();
     g.upsert_peer(&req.name, &uri, req.rpc.as_deref(), req.p2p.as_deref());
     let ep = g.peers.get(&req.name).cloned();
@@ -1533,9 +1680,13 @@ async fn add_peer(
 
 async fn link_secondary(
     State(st): State<RpcState>,
+    headers: HeaderMap,
     Json(_req): Json<LinkSecondaryRequest>,
 ) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
+    if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+        return *resp;
+    }
     let secondary = DeviceKeypair::generate();
     match g.link.create_link_request(&secondary) {
         Ok(request) => match g.link.approve_link(&g.keypair, &request) {
@@ -2200,9 +2351,75 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "p2p_uri": g.p2p_uri,
         "rpc_base": g.rpc_base,
+        "advertise_host": g.advertise_host,
+        "relay_uri": g.relay_uri,
+        "relay_last_fetch_ms": g.relay_last_fetch_ms,
+        "relay_last_error": g.relay_last_error,
+        "relay_last_fetched": g.relay_last_fetched,
+        "require_owner": st.require_owner,
         "peers": g.peers.values().collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+async fn remote_status(State(st): State<RpcState>) -> impl IntoResponse {
+    p2p_status(State(st)).await
+}
+
+async fn relay_poll_now(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+            if st.require_owner {
+                return *resp;
+            }
+        }
+        if g.relay_uri.is_none() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "no relay configured (TD_RELAY_URI)".into(),
+                }),
+            )
+                .into_response();
+        }
+    }
+    match poll_relay_once(&st).await {
+        Ok(n) => Json(serde_json::json!({"ok": true, "fetched": n})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn relay_push_now(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+            if st.require_owner {
+                return *resp;
+            }
+        }
+        if g.relay_uri.is_none() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "no relay configured (TD_RELAY_URI)".into(),
+                }),
+            )
+                .into_response();
+        }
+    }
+    match push_outbox_to_relay(&st).await {
+        Ok(n) => Json(serde_json::json!({"ok": true, "pushed": n})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody { error: e }),
+        )
+            .into_response(),
+    }
 }
 
 /// Build the localhost RPC router.
@@ -2247,6 +2464,9 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/e2ee/import-olm", post(import_session_olm))
         .route("/v1/e2ee/share-session", post(share_session_with_peer))
         .route("/v1/p2p", get(p2p_status))
+        .route("/v1/remote", get(remote_status))
+        .route("/v1/relay/poll", post(relay_poll_now))
+        .route("/v1/relay/push", post(relay_push_now))
         .layer(cors)
         .with_state(state)
 }
@@ -2255,23 +2475,42 @@ pub fn new_state() -> RpcState {
     RpcState {
         inner: Arc::new(Mutex::new(NodeSession::new())),
         notify: Arc::new(RoomNotify::new()),
+        require_owner: false,
     }
 }
 
 /// Build RPC state loading durable identity + claim from `data_dir`.
 pub fn new_state_with_data_dir(data_dir: impl Into<std::path::PathBuf>) -> Result<RpcState, String> {
-    let dir = NodeDataDir::new(data_dir.into());
-    let session = NodeSession::load_from_data_dir(dir)?;
-    Ok(RpcState {
-        inner: Arc::new(Mutex::new(session)),
-        notify: Arc::new(RoomNotify::new()),
+    new_state_with_options(ServeOptions {
+        data_dir: Some(data_dir.into()),
+        ..Default::default()
     })
 }
 
-async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+/// Build RPC state from full serve options.
+pub fn new_state_with_options(opts: ServeOptions) -> Result<RpcState, String> {
+    let mut session = if let Some(dir) = opts.data_dir.clone() {
+        NodeSession::load_from_data_dir(NodeDataDir::new(dir))?
+    } else {
+        NodeSession::new()
+    };
+    session.apply_remote_opts(&opts);
+    // require_owner decided at serve() from bind + flag; default false here.
+    Ok(RpcState {
+        inner: Arc::new(Mutex::new(session)),
+        notify: Arc::new(RoomNotify::new()),
+        require_owner: false,
+    })
+}
+
+async fn start_p2p_listener(
+    state: RpcState,
+    p2p_bind: &str,
+    advertise_host: Option<&str>,
+) -> Result<String, std::io::Error> {
+    let listener = TcpListener::bind(p2p_bind).await?;
     let addr = listener.local_addr()?;
-    let uri = PeerUri::from_tcp_addr(addr).to_string_uri();
+    let uri = advertise_p2p_uri(addr, advertise_host);
     {
         let mut g = state.inner.lock().await;
         g.p2p_uri = Some(uri.clone());
@@ -2301,10 +2540,138 @@ async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
     Ok(uri)
 }
 
+async fn poll_relay_once(state: &RpcState) -> Result<u32, String> {
+    let (relay_uri, pad, device_id) = {
+        let g = state.inner.lock().await;
+        let uri = g
+            .relay_uri
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        (uri, g.relay_pad, g.keypair.event_device_id())
+    };
+    let peer = PeerUri::parse(&relay_uri).map_err(|e| e.to_string())?;
+    let mut client = RelayClient::connect(&peer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let items = client
+        .fetch(device_id, 0, 64)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut acked = Vec::new();
+    let mut inserted = 0u32;
+    for env in items {
+        match DeviceNode::open_from_relay(&env.ciphertext, pad) {
+            Ok(ev) => {
+                let room_id = ev.room_id;
+                let ok = {
+                    let mut g = state.inner.lock().await;
+                    g.ingest_remote(ev).unwrap_or(false)
+                };
+                if ok {
+                    inserted += 1;
+                    notify_room_from_id(state, &room_id).await;
+                }
+                acked.push(env.envelope_id);
+            }
+            Err(e) => {
+                let mut g = state.inner.lock().await;
+                g.relay_last_error = Some(format!("open envelope: {e}"));
+            }
+        }
+    }
+    if !acked.is_empty() {
+        let _ = client.ack(device_id, acked).await;
+    }
+    {
+        let mut g = state.inner.lock().await;
+        g.relay_last_fetch_ms = Some(now_ms());
+        g.relay_last_fetched = inserted;
+        if inserted > 0 {
+            g.relay_last_error = None;
+        }
+    }
+    Ok(inserted)
+}
+
+fn spawn_relay_poller(state: RpcState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            let has = {
+                let g = state.inner.lock().await;
+                g.relay_uri.is_some()
+            };
+            if !has {
+                continue;
+            }
+            if let Err(e) = poll_relay_once(&state).await {
+                let mut g = state.inner.lock().await;
+                g.relay_last_error = Some(e);
+                g.relay_last_fetch_ms = Some(now_ms());
+            }
+        }
+    });
+}
+
+/// Push sealed local outbox events to the configured relay for each known peer device id
+/// is not available yet; MVP push is explicit via outbox for linked secondary device ids
+/// stored in link registry (best-effort assist).
+async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
+    let (relay_uri, pad, sender, recipients, events) = {
+        let mut g = state.inner.lock().await;
+        let uri = g
+            .relay_uri
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        let pad = g.relay_pad;
+        let sender = g.keypair.event_device_id();
+        let recipients: Vec<td_event::DeviceId> = g
+            .link
+            .linked_devices()
+            .into_iter()
+            .filter(|d| *d != g.keypair.device_id())
+            .map(|d| d.into())
+            .collect();
+        // Drain a bounded number from outbox for relay assist.
+        let mut events = Vec::new();
+        for _ in 0..16 {
+            match g.node.pop_outbox() {
+                Some(ev) => events.push(ev),
+                None => break,
+            }
+        }
+        (uri, pad, sender, recipients, events)
+    };
+    if events.is_empty() || recipients.is_empty() {
+        return Ok(0);
+    }
+    let peer = PeerUri::parse(&relay_uri).map_err(|e| e.to_string())?;
+    let mut client = RelayClient::connect(&peer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut n = 0u32;
+    for ev in events {
+        let ct = DeviceNode::seal_for_relay(&ev, pad).map_err(|e| e.to_string())?;
+        for recip in &recipients {
+            let env = RelayEnvelope::new(
+                *recip,
+                sender,
+                Some(ev.room_id),
+                ct.clone(),
+                ev.ts_ms,
+            );
+            client.put(env).await.map_err(|e| e.to_string())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Serve RPC on `bind` (e.g. 127.0.0.1:8788). Returns local addr after bind.
-/// In-memory only (tests / smoke). Prefer `serve_with_data_dir` for Pond.
+/// In-memory only (tests / smoke). Prefer `serve_with_options` for Pond.
 pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
-    serve_with_optional_data_dir(bind, None).await
+    serve_with_options(bind, ServeOptions::default()).await
 }
 
 /// Serve RPC with durable identity + claim under `data_dir`.
@@ -2312,26 +2679,22 @@ pub async fn serve_with_data_dir(
     bind: &str,
     data_dir: impl Into<std::path::PathBuf>,
 ) -> Result<SocketAddr, std::io::Error> {
-    serve_with_optional_data_dir(bind, Some(data_dir.into())).await
+    serve_with_options(
+        bind,
+        ServeOptions {
+            data_dir: Some(data_dir.into()),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn serve_with_optional_data_dir(
+/// Serve RPC with full remote-access options.
+pub async fn serve_with_options(
     bind: &str,
-    data_dir: Option<std::path::PathBuf>,
+    opts: ServeOptions,
 ) -> Result<SocketAddr, std::io::Error> {
-    let state = match data_dir {
-        Some(dir) => new_state_with_data_dir(dir).map_err(std::io::Error::other)?,
-        None => new_state(),
-    };
-    let p2p = start_p2p_listener(state.clone())
-        .await
-        .unwrap_or_else(|_| "td://?".into());
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    let addr = listener.local_addr()?;
-    {
-        let mut g = state.inner.lock().await;
-        g.rpc_base = Some(format!("http://{addr}"));
-    }
+    let (state, p2p, listener, addr) = prepare_serve(bind, opts).await?;
     let app = router(state);
     eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     tokio::spawn(async move {
@@ -2342,7 +2705,7 @@ async fn serve_with_optional_data_dir(
 
 /// Serve and block (for binary embedding). In-memory only.
 pub async fn serve_blocking(bind: &str) -> Result<(), std::io::Error> {
-    serve_blocking_with_optional_data_dir(bind, None).await
+    serve_blocking_with_options(bind, ServeOptions::default()).await
 }
 
 /// Serve and block with durable identity + claim under `data_dir`.
@@ -2350,34 +2713,72 @@ pub async fn serve_blocking_with_data_dir(
     bind: &str,
     data_dir: impl Into<std::path::PathBuf>,
 ) -> Result<(), std::io::Error> {
-    serve_blocking_with_optional_data_dir(bind, Some(data_dir.into())).await
+    serve_blocking_with_options(
+        bind,
+        ServeOptions {
+            data_dir: Some(data_dir.into()),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn serve_blocking_with_optional_data_dir(
+/// Serve and block with full options (CLI entrypoint).
+pub async fn serve_blocking_with_options(
     bind: &str,
-    data_dir: Option<std::path::PathBuf>,
+    opts: ServeOptions,
 ) -> Result<(), std::io::Error> {
-    let state = match data_dir {
-        Some(dir) => new_state_with_data_dir(dir).map_err(std::io::Error::other)?,
-        None => new_state(),
-    };
-    let p2p = start_p2p_listener(state.clone()).await?;
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    let addr = listener.local_addr()?;
-    let data_note = {
+    let (state, p2p, listener, addr) = prepare_serve(bind, opts).await?;
+    let notes = {
         let g = state.inner.lock().await;
-        g.data_dir
+        let data = g
+            .data_dir
             .as_ref()
             .map(|d| format!(" data={}", d.root().display()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let relay = g
+            .relay_uri
+            .as_ref()
+            .map(|r| format!(" relay={r}"))
+            .unwrap_or_default();
+        let adv = g
+            .advertise_host
+            .as_ref()
+            .map(|h| format!(" advertise={h}"))
+            .unwrap_or_default();
+        let own = if state.require_owner {
+            " owner_gate=on"
+        } else {
+            " owner_gate=off"
+        };
+        format!("{data}{relay}{adv}{own}")
     };
+    let app = router(state);
+    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}{notes}");
+    axum::serve(listener, app).await
+}
+
+async fn prepare_serve(
+    bind: &str,
+    opts: ServeOptions,
+) -> Result<(RpcState, String, tokio::net::TcpListener, SocketAddr), std::io::Error> {
+    let require_owner = opts.require_owner_non_loopback && !is_loopback_bind(bind);
+    let advertise = opts.advertise_host.clone();
+    let p2p_bind = opts
+        .p2p_bind
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:0".into());
+    let mut state = new_state_with_options(opts).map_err(std::io::Error::other)?;
+    state.require_owner = require_owner;
+    let p2p = start_p2p_listener(state.clone(), &p2p_bind, advertise.as_deref()).await?;
+    spawn_relay_poller(state.clone());
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let addr = listener.local_addr()?;
     {
         let mut g = state.inner.lock().await;
-        g.rpc_base = Some(format!("http://{addr}"));
+        g.rpc_base = Some(advertise_http_base(addr, advertise.as_deref()));
     }
-    let app = router(state);
-    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}{data_note}");
-    axum::serve(listener, app).await
+    Ok((state, p2p, listener, addr))
 }
 
 /// Happy-path in-process exercise used by CLI tests and CI.
@@ -2437,6 +2838,3 @@ pub fn happy_path_script() -> Result<String, String> {
     ))
 }
 
-// silence unused import warning for DeviceId in some builds
-#[allow(dead_code)]
-fn _device_id_ty(_: DeviceId) {}

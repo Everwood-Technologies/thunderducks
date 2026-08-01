@@ -40,8 +40,9 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.2d | **First-run claim + pairing UI** | ✅ done |
 | P3.2e | **Durable claim + identity** (`TD_DATA_DIR`) | ✅ done |
 | P3.2f | **Recovery login + owner session** | ✅ done |
+| P3.2g | **Remote access slice** (advertise host, P2P bind, relay poll/push, owner gate off-loopback) | ✅ done |
 | P3.3 | Encrypted history catch-up packaging polish | open |
-| P3.4 | Rate limits / authn on node RPC if ever non-localhost |
+| P3.4 | Full RPC authn + rate limits if ever non-localhost | partial (owner gate admin) |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |
 | P3.6 | Mobile / Tauri (explicitly deferred) |
 | P3.7 | Metadata-privacy hardening (not MVP) |

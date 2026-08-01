@@ -6,9 +6,10 @@ mod sync;
 
 pub use persist::{ClaimDisk, NodeDataDir, PersistError};
 pub use rpc::{
-    happy_path_script, new_state, new_state_with_data_dir, router, serve, serve_blocking,
-    serve_blocking_with_data_dir, serve_with_data_dir, CreateRoomRequest, CreateRoomResponse,
-    MessageView, MessagesResponse, RpcState, SendRequest, SendResponse, StatusResponse,
+    happy_path_script, new_state, new_state_with_data_dir, new_state_with_options, router, serve,
+    serve_blocking, serve_blocking_with_data_dir, serve_blocking_with_options, serve_with_data_dir,
+    serve_with_options, CreateRoomRequest, CreateRoomResponse, MessageView, MessagesResponse,
+    RpcState, SendRequest, SendResponse, ServeOptions, StatusResponse,
 };
 pub use sync::{DeviceNode, SyncError, SyncOffer, SyncResponse};
 
@@ -507,6 +508,111 @@ mod tests {
             assert_eq!(after.status(), reqwest::StatusCode::UNAUTHORIZED);
 
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn remote_advertise_and_owner_gate_on_non_loopback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+
+            // Loopback: advertise host rewrites rpc_base / p2p_uri; owner gate off.
+            let opts = ServeOptions {
+                advertise_host: Some("pond.tailnet".into()),
+                p2p_bind: Some("127.0.0.1:0".into()),
+                require_owner_non_loopback: true,
+                ..Default::default()
+            };
+            let addr = serve_with_options("127.0.0.1:0", opts)
+                .await
+                .expect("bind loopback");
+            let base = format!("http://{addr}");
+            let st: serde_json::Value = client
+                .get(format!("{base}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(st["require_owner"], false);
+            assert_eq!(st["advertise_host"], "pond.tailnet");
+            let rpc_base = st["rpc_base"].as_str().unwrap();
+            assert!(rpc_base.starts_with("http://pond.tailnet:"), "{rpc_base}");
+            let p2p = st["p2p_uri"].as_str().unwrap();
+            assert!(p2p.starts_with("td://pond.tailnet:"), "{p2p}");
+
+            // add_peer allowed without owner on loopback
+            let peer_ok = client
+                .post(format!("{base}/v1/peers"))
+                .json(&serde_json::json!({"name": "bob", "uri": "td://127.0.0.1:9"}))
+                .send()
+                .await
+                .unwrap();
+            assert!(peer_ok.status().is_success());
+
+            // Non-loopback bind: owner gate on for admin mutations.
+            let opts2 = ServeOptions {
+                advertise_host: Some("100.64.0.2".into()),
+                p2p_bind: Some("127.0.0.1:0".into()),
+                require_owner_non_loopback: true,
+                ..Default::default()
+            };
+            let addr2 = serve_with_options("0.0.0.0:0", opts2)
+                .await
+                .expect("bind all");
+            // Hit via loopback address of the ephemeral port.
+            let base2 = format!("http://127.0.0.1:{}", addr2.port());
+            let st2: serde_json::Value = client
+                .get(format!("{base2}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(st2["require_owner"], true);
+            assert_eq!(st2["advertise_host"], "100.64.0.2");
+
+            let denied = client
+                .post(format!("{base2}/v1/peers"))
+                .json(&serde_json::json!({"name": "eve", "uri": "td://1.2.3.4:9"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            // Claim mints owner token → admin works.
+            let claim: serde_json::Value = client
+                .post(format!("{base2}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Remote Pond"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let owner = claim["owner_token"].as_str().unwrap();
+            let allowed = client
+                .post(format!("{base2}/v1/peers"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .json(&serde_json::json!({"name": "alice", "uri": "td://100.64.0.3:9"}))
+                .send()
+                .await
+                .unwrap();
+            assert!(allowed.status().is_success());
+
+            let remote: serde_json::Value = client
+                .get(format!("{base2}/v1/remote"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(remote["require_owner"], true);
+            assert_eq!(remote["advertise_host"], "100.64.0.2");
         });
     }
 }
