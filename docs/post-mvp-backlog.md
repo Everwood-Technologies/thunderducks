@@ -8,9 +8,8 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Why | Notes |
 |----|------|-----|-------|
-| P0.1 | **Rotate GitHub PATs** pasted in chat | Credential hygiene | Classic PAT used for `repo`+`workflow`+`read:org`; revoke old tokens in GitHub settings |
 | P0.2 | **SECURITY.md** + vulnerability contact | Public AGPL repo baseline | Landed in this polish pass |
-| P0.3 | Host **healthcheck** (OpenClaw box) | Operator exposure | Separate thread; pick posture Convenience/Balanced/Strict |
+| P0.3 | Host **healthcheck** (OpenClaw box) | Operator exposure | Separate thread; posture Balanced + C+ applied on ops host |
 
 ## P1 — product honesty gaps
 
@@ -46,15 +45,14 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 ## Suggested order
 
-1. P0.1 PAT rotate (human)  
-2. P0.2 SECURITY.md ✅  
-3. P1.2/P1.3 harness glue ✅  
-4. P1.4 threat-model ↔ impl diff ✅  
-5. P2.1 Pages ✅  
-6. P1.1 WebAuthn ✅  
-7. High/prod from P1.4: encrypt RPC payloads ✅ (Megolm default); transport auth still open  
-8. P0.3 healthcheck (ops)  
-9. P3.* as interest/funding allows  
+1. P0.2 SECURITY.md ✅  
+2. P1.2/P1.3 harness glue ✅  
+3. P1.4 threat-model ↔ impl diff ✅  
+4. P2.1 Pages ✅  
+5. P1.1 WebAuthn ✅  
+6. High/prod from P1.4: encrypt RPC payloads ✅ (Megolm default); transport auth still open  
+7. P0.3 healthcheck (ops) ✅ Balanced + C+ on ops host  
+8. P3.* as interest/funding allows (Pond claim UX, QUIC, etc.)  
 
 ## Out of scope forever (unless new Gate)
 
