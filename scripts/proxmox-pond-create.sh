@@ -86,11 +86,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 bootstrap_script() {
+  # Fresh Ubuntu LXC templates often lack curl/ca-certificates.
   cat <<EOF
+set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TDUCKS_VERSION='${VERSION}'
 export TDUCKS_REPO='${REPO}'
 export POND_WEB_REF='${WEB_REF}'
+need_pkgs=0
+command -v curl >/dev/null 2>&1 || need_pkgs=1
+[[ -f /etc/ssl/certs/ca-certificates.crt ]] || need_pkgs=1
+if [[ "\$need_pkgs" -eq 1 ]]; then
+  apt-get update -y
+  apt-get install -y --no-install-recommends ca-certificates curl
+  update-ca-certificates || true
+fi
 curl -fsSL 'https://raw.githubusercontent.com/${REPO}/${WEB_REF}/scripts/pond-guest-bootstrap.sh' | bash
 EOF
 }
@@ -305,8 +315,21 @@ fi
 if [[ "$BOOTSTRAP" -eq 1 && "$START" -eq 1 ]]; then
   log "waiting for guest exec channel"
   wait_guest_exec || die "guest exec not ready"
+  # Network can lag DHCP after CT start — wait for outbound DNS/HTTP briefly.
+  log "waiting for guest network"
+  if [[ "$TYPE" == "lxc" ]]; then
+    pct exec "$VMID" -- bash -lc '
+      for i in $(seq 1 60); do
+        getent hosts github.com >/dev/null 2>&1 && exit 0
+        # busybox/ubuntu may lack getent early; try ping gateway or ip route
+        ip route | grep -q default && exit 0
+        sleep 2
+      done
+      exit 1
+    ' || log "warn: guest network probe timed out — bootstrap may still work"
+  fi
   log "running pond-guest-bootstrap (${VERSION})"
-  # Stream bootstrap into guest
+  # Stream bootstrap into guest (installs curl first if missing)
   run_in_guest "$(bootstrap_script)"
 else
   log "skip bootstrap (print with --print-bootstrap)"
