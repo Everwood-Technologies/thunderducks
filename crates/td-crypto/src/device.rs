@@ -43,6 +43,18 @@ impl DeviceKeypair {
         Self { signing, device_id }
     }
 
+    /// Reconstruct from the 32-byte ed25519 seed (SigningKey secret).
+    pub fn from_seed_bytes(seed: &[u8; 32]) -> Self {
+        let signing = SigningKey::from_bytes(seed);
+        let device_id = DeviceId::from_verifying_key(&signing.verifying_key());
+        Self { signing, device_id }
+    }
+
+    /// Export the 32-byte ed25519 seed for durable node identity.
+    pub fn to_seed_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
     pub fn device_id(&self) -> DeviceId {
         self.device_id
     }

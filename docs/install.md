@@ -123,7 +123,25 @@ With a node running and the web client pointed at it (`?rpc=`):
 
 Recovery code is shown **once** at claim; only a hash is stored on the node.
 
-**Still later Pond phases:** OTA, Wi‑Fi wizard, tailnet/relay UX.
+### Durable claim + identity
+
+With `TD_DATA_DIR` / `--data-dir` (systemd default: `/var/lib/thunderducks`):
+
+| File | Contents |
+|------|----------|
+| `identity.key` | 32-byte ed25519 seed (mode `0600`) — stable device id across restarts |
+| `claim.json` | Owner claim: display name + recovery **hash** only (no plaintext code) |
+
+```bash
+tducks serve --bind 127.0.0.1:8788 --data-dir /var/lib/thunderducks
+# or: TD_DATA_DIR=/var/lib/thunderducks tducks serve --bind 127.0.0.1:8788
+```
+
+Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
+
+Pair tokens remain short-lived and in-memory by design.
+
+**Still later Pond phases:** recovery-login path, OTA, Wi‑Fi wizard, tailnet/relay UX.
 
 ## Security notes
 

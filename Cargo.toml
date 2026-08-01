@@ -39,7 +39,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 bytes = "1"
 tracing = "0.1"
 vodozemac = "0.10"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"

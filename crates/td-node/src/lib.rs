@@ -1,12 +1,14 @@
 //! Node runtime: multi-device sync + local HTTP RPC (Waves D2 + E).
 
+mod persist;
 mod rpc;
 mod sync;
 
+pub use persist::{ClaimDisk, NodeDataDir, PersistError};
 pub use rpc::{
-    happy_path_script, new_state, router, serve, serve_blocking, CreateRoomRequest,
-    CreateRoomResponse, MessageView, MessagesResponse, RpcState, SendRequest, SendResponse,
-    StatusResponse,
+    happy_path_script, new_state, new_state_with_data_dir, router, serve, serve_blocking,
+    serve_blocking_with_data_dir, serve_with_data_dir, CreateRoomRequest, CreateRoomResponse,
+    MessageView, MessagesResponse, RpcState, SendRequest, SendResponse, StatusResponse,
 };
 pub use sync::{DeviceNode, SyncError, SyncOffer, SyncResponse};
 
@@ -284,6 +286,94 @@ mod tests {
                 .unwrap();
             assert_eq!(redeem["paired"], true);
             assert_eq!(redeem["pond_name"], "Test Pond");
+        });
+    }
+
+    #[test]
+    fn claim_survives_restart_with_data_dir() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "td-claim-dur-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let client = reqwest::Client::new();
+
+            // Boot 1: claim
+            let addr1 = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind 1");
+            let base1 = format!("http://{addr1}");
+            let claim: serde_json::Value = client
+                .post(format!("{base1}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Durable Pond"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(claim["ok"], true);
+            let device_id = claim["device_id"].as_str().unwrap().to_string();
+            let recovery = claim["recovery_code"].as_str().unwrap().to_string();
+            assert!(recovery.len() >= 8);
+
+            // Drop server by letting it go out of scope... we need a second process-like restart.
+            // serve_with_data_dir spawns in background; start a second listener on new port
+            // loading the same data dir (simulates restart; first may still run — claim is durable).
+            let addr2 = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind 2");
+            let base2 = format!("http://{addr2}");
+
+            let st: StatusResponse = client
+                .get(format!("{base2}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(st.claimed);
+            assert_eq!(st.display_name.as_deref(), Some("Durable Pond"));
+            assert_eq!(st.device_id, device_id);
+
+            let cs: serde_json::Value = client
+                .get(format!("{base2}/v1/claim"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cs["claimed"], true);
+            assert_eq!(cs["display_name"], "Durable Pond");
+            assert_eq!(cs["device_id"], device_id);
+
+            // Second claim must conflict
+            let again = client
+                .post(format!("{base2}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Nope"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(again.status(), reqwest::StatusCode::CONFLICT);
+
+            // Disk layout sanity
+            assert!(dir.join("identity.key").is_file());
+            assert!(dir.join("claim.json").is_file());
+            let claim_raw = std::fs::read_to_string(dir.join("claim.json")).unwrap();
+            assert!(claim_raw.contains("Durable Pond"));
+            assert!(!claim_raw.contains(&recovery));
+            assert!(!claim_raw.to_lowercase().contains("recovery_code"));
+
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 }

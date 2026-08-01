@@ -13,7 +13,8 @@ Environment=TD_DATA_DIR=/var/lib/thunderducks
 Environment=TD_BIND=127.0.0.1:8788
 # Optional overrides: /etc/thunderducks/tducks.env
 EnvironmentFile=-/etc/thunderducks/tducks.env
-ExecStart=/usr/bin/tducks serve --bind ${TD_BIND}
+# TD_DATA_DIR is read by tducks (identity.key + claim.json)
+ExecStart=/usr/bin/tducks serve --bind ${TD_BIND} --data-dir ${TD_DATA_DIR}
 Restart=on-failure
 RestartSec=2
 # Hardening (safe defaults for localhost RPC)

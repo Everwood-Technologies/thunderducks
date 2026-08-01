@@ -121,7 +121,7 @@ Group=tducks
 Environment=TD_DATA_DIR=${DATA_DIR}
 Environment=TD_BIND=${BIND}
 EnvironmentFile=-${CONF_DIR}/tducks.env
-ExecStart=${BIN_DST} serve --bind \${TD_BIND}
+ExecStart=${BIN_DST} serve --bind \${TD_BIND} --data-dir \${TD_DATA_DIR}
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
@@ -178,6 +178,7 @@ main() {
   echo "  rpc:    curl -s http://${BIND}/health || curl -s http://127.0.0.1:8788/health"
   echo
   echo "Note: default bind is loopback. For LAN clients set TD_BIND in ${CONF_DIR}/tducks.env and open firewall carefully."
+  echo "Data dir holds identity.key + claim.json (claim survives restart)."
 }
 
 main

@@ -32,6 +32,17 @@ mod tests {
     }
 
     #[test]
+    fn device_seed_roundtrip() {
+        let a = DeviceKeypair::generate();
+        let b = DeviceKeypair::from_seed_bytes(&a.to_seed_bytes());
+        assert_eq!(a.device_id(), b.device_id());
+        assert_eq!(
+            a.verifying_key().as_bytes(),
+            b.verifying_key().as_bytes()
+        );
+    }
+
+    #[test]
     fn two_devices_link_without_network() {
         let primary = DeviceKeypair::generate();
         let secondary = DeviceKeypair::generate();

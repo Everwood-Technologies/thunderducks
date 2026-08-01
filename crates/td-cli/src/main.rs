@@ -28,6 +28,9 @@ enum Commands {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8788")]
         bind: String,
+        /// Durable data dir (identity.key + claim.json). Falls back to $TD_DATA_DIR.
+        #[arg(long, env = "TD_DATA_DIR")]
+        data_dir: Option<std::path::PathBuf>,
     },
     /// Show node status
     Status,
@@ -70,10 +73,15 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("{out}");
             Ok(())
         }
-        Commands::Serve { bind } => {
-            td_node::serve_blocking(&bind)
-                .await
-                .map_err(|e| e.to_string())?;
+        Commands::Serve { bind, data_dir } => {
+            match data_dir {
+                Some(dir) => td_node::serve_blocking_with_data_dir(&bind, dir)
+                    .await
+                    .map_err(|e| e.to_string())?,
+                None => td_node::serve_blocking(&bind)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            }
             Ok(())
         }
         Commands::Status => {

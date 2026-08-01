@@ -27,6 +27,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::persist::NodeDataDir;
 use crate::sync::{DeviceNode, SyncOffer};
 
 /// Room-scoped change signal for wait long-poll + SSE.
@@ -102,11 +103,20 @@ struct NodeSession {
     claim: ClaimState,
     /// Active short-lived pairing invites (token -> meta).
     pair_tokens: HashMap<String, PairToken>,
+    /// Optional durable store (identity + claim). None = pure in-memory.
+    data_dir: Option<NodeDataDir>,
 }
 
 impl NodeSession {
     fn new() -> Self {
-        let keypair = DeviceKeypair::generate();
+        Self::from_parts(DeviceKeypair::generate(), ClaimState::default(), None)
+    }
+
+    fn from_parts(
+        keypair: DeviceKeypair,
+        claim: ClaimState,
+        data_dir: Option<NodeDataDir>,
+    ) -> Self {
         let mut link = LinkRegistry::new(keypair.device_id());
         let _ = link.trust_local(&keypair);
         let node = DeviceNode::from_crypto_device(keypair.device_id());
@@ -123,9 +133,26 @@ impl NodeSession {
             ts_counter: 1,
             p2p_uri: None,
             rpc_base: None,
-            claim: ClaimState::default(),
+            claim,
             pair_tokens: HashMap::new(),
+            data_dir,
         }
+    }
+
+    fn load_from_data_dir(dir: NodeDataDir) -> Result<Self, String> {
+        let keypair = dir
+            .load_or_create_identity()
+            .map_err(|e| format!("identity: {e}"))?;
+        let claim = dir.load_claim().map_err(|e| format!("claim: {e}"))?;
+        Ok(Self::from_parts(keypair, claim, Some(dir)))
+    }
+
+    fn persist_claim(&self) -> Result<(), String> {
+        if let Some(dir) = &self.data_dir {
+            dir.save_claim(&self.claim)
+                .map_err(|e| format!("persist claim: {e}"))?;
+        }
+        Ok(())
     }
 
     fn purge_expired_pair_tokens(&mut self) {
@@ -236,13 +263,13 @@ pub struct PeerInfo {
 
 /// Owner claim state for first-run Pond setup.
 #[derive(Debug, Clone, Default)]
-struct ClaimState {
-    claimed: bool,
-    display_name: Option<String>,
+pub(crate) struct ClaimState {
+    pub(crate) claimed: bool,
+    pub(crate) display_name: Option<String>,
     /// blake3 hex of recovery code (never store plaintext).
     #[allow(dead_code)] // reserved for future recovery-login path
-    recovery_hash: Option<String>,
-    claimed_at_ms: Option<u64>,
+    pub(crate) recovery_hash: Option<String>,
+    pub(crate) claimed_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +599,17 @@ async fn claim_node(
         recovery_hash: Some(hash_recovery(&code)),
         claimed_at_ms: Some(at),
     };
+    if let Err(e) = g.persist_claim() {
+        // Roll back in-memory claim so a retry can succeed.
+        g.claim = ClaimState::default();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e,
+            }),
+        )
+            .into_response();
+    }
     Json(ClaimResponse {
         ok: true,
         claimed: true,
@@ -1926,6 +1964,16 @@ pub fn new_state() -> RpcState {
     }
 }
 
+/// Build RPC state loading durable identity + claim from `data_dir`.
+pub fn new_state_with_data_dir(data_dir: impl Into<std::path::PathBuf>) -> Result<RpcState, String> {
+    let dir = NodeDataDir::new(data_dir.into());
+    let session = NodeSession::load_from_data_dir(dir)?;
+    Ok(RpcState {
+        inner: Arc::new(Mutex::new(session)),
+        notify: Arc::new(RoomNotify::new()),
+    })
+}
+
 async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -1960,8 +2008,27 @@ async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
 }
 
 /// Serve RPC on `bind` (e.g. 127.0.0.1:8788). Returns local addr after bind.
+/// In-memory only (tests / smoke). Prefer `serve_with_data_dir` for Pond.
 pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
-    let state = new_state();
+    serve_with_optional_data_dir(bind, None).await
+}
+
+/// Serve RPC with durable identity + claim under `data_dir`.
+pub async fn serve_with_data_dir(
+    bind: &str,
+    data_dir: impl Into<std::path::PathBuf>,
+) -> Result<SocketAddr, std::io::Error> {
+    serve_with_optional_data_dir(bind, Some(data_dir.into())).await
+}
+
+async fn serve_with_optional_data_dir(
+    bind: &str,
+    data_dir: Option<std::path::PathBuf>,
+) -> Result<SocketAddr, std::io::Error> {
+    let state = match data_dir {
+        Some(dir) => new_state_with_data_dir(dir).map_err(std::io::Error::other)?,
+        None => new_state(),
+    };
     let p2p = start_p2p_listener(state.clone())
         .await
         .unwrap_or_else(|_| "td://?".into());
@@ -1979,18 +2046,43 @@ pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
     Ok(addr)
 }
 
-/// Serve and block (for binary embedding).
+/// Serve and block (for binary embedding). In-memory only.
 pub async fn serve_blocking(bind: &str) -> Result<(), std::io::Error> {
-    let state = new_state();
+    serve_blocking_with_optional_data_dir(bind, None).await
+}
+
+/// Serve and block with durable identity + claim under `data_dir`.
+pub async fn serve_blocking_with_data_dir(
+    bind: &str,
+    data_dir: impl Into<std::path::PathBuf>,
+) -> Result<(), std::io::Error> {
+    serve_blocking_with_optional_data_dir(bind, Some(data_dir.into())).await
+}
+
+async fn serve_blocking_with_optional_data_dir(
+    bind: &str,
+    data_dir: Option<std::path::PathBuf>,
+) -> Result<(), std::io::Error> {
+    let state = match data_dir {
+        Some(dir) => new_state_with_data_dir(dir).map_err(std::io::Error::other)?,
+        None => new_state(),
+    };
     let p2p = start_p2p_listener(state.clone()).await?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
+    let data_note = {
+        let g = state.inner.lock().await;
+        g.data_dir
+            .as_ref()
+            .map(|d| format!(" data={}", d.root().display()))
+            .unwrap_or_default()
+    };
     {
         let mut g = state.inner.lock().await;
         g.rpc_base = Some(format!("http://{addr}"));
     }
     let app = router(state);
-    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
+    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}{data_note}");
     axum::serve(listener, app).await
 }
 
