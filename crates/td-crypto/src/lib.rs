@@ -11,15 +11,15 @@ pub use e2ee::{
     fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
     RoomOutboundPackage, ROOM_PICKLE_KEY,
 };
-pub use relay_seal::{
-    derive_relay_key, open_bytes, open_bytes_auto, open_bytes_olm, parse_relay_key_material,
-    seal_bytes, seal_bytes_olm, seal_version, RelayOlmWire, RelaySealError,
-    DEFAULT_RELAY_KEY_MATERIAL, RELAY_SEAL_V1, RELAY_SEAL_V2_OLM,
-};
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
 pub use passkey::{
     b64url, PasskeyError, PasskeyRegistry, PublicKeyCredentialCreationOptions,
     PublicKeyCredentialRequestOptions, StoredCredential,
+};
+pub use relay_seal::{
+    derive_relay_key, open_bytes, open_bytes_auto, open_bytes_olm, parse_relay_key_material,
+    seal_bytes, seal_bytes_olm, seal_version, RelayOlmWire, RelaySealError,
+    DEFAULT_RELAY_KEY_MATERIAL, RELAY_SEAL_V1, RELAY_SEAL_V2_OLM,
 };
 
 /// Crate smoke marker used by CI.
@@ -42,10 +42,7 @@ mod tests {
         let a = DeviceKeypair::generate();
         let b = DeviceKeypair::from_seed_bytes(&a.to_seed_bytes());
         assert_eq!(a.device_id(), b.device_id());
-        assert_eq!(
-            a.verifying_key().as_bytes(),
-            b.verifying_key().as_bytes()
-        );
+        assert_eq!(a.verifying_key().as_bytes(), b.verifying_key().as_bytes());
     }
 
     #[test]

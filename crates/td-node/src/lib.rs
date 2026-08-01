@@ -133,8 +133,7 @@ mod tests {
         assert!(!ct2.windows(2).any(|w| w == b"{}"));
         // Shared AEAD cannot open v2.
         assert!(DeviceNode::open_from_relay(&ct2, &key).is_err());
-        let opened2 =
-            DeviceNode::open_from_relay_auto(&mut bob_e2ee, Some(&key), &ct2).unwrap();
+        let opened2 = DeviceNode::open_from_relay_auto(&mut bob_e2ee, Some(&key), &ct2).unwrap();
         assert_eq!(opened2.id, create.id);
         // Wrong recipient cannot open.
         let mut carol = td_crypto::E2eeDevice::new(DeviceKeypair::generate().device_id());
@@ -670,9 +669,7 @@ mod tests {
                 rate_limit: true,
                 ..Default::default()
             };
-            let addr = serve_with_options("127.0.0.1:0", opts)
-                .await
-                .expect("bind");
+            let addr = serve_with_options("127.0.0.1:0", opts).await.expect("bind");
             let base = format!("http://{addr}");
 
             // Claim once, then spam POST /v1/claim (tight 10/min bucket).
@@ -707,8 +704,7 @@ mod tests {
                 }
                 // 409 conflict while still under the window is expected
                 assert!(
-                    r.status() == reqwest::StatusCode::CONFLICT
-                        || r.status().is_success(),
+                    r.status() == reqwest::StatusCode::CONFLICT || r.status().is_success(),
                     "unexpected status {}",
                     r.status()
                 );

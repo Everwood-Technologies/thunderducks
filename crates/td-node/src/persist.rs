@@ -234,7 +234,7 @@ mod tests {
         };
         store.save_claim(&claim).unwrap();
         let loaded = store.load_claim().unwrap();
-        assert_eq!(loaded.claimed, true);
+        assert!(loaded.claimed);
         assert_eq!(loaded.display_name.as_deref(), Some("Pond Alpha"));
         assert_eq!(loaded.recovery_hash.as_deref(), Some("abc123"));
         assert_eq!(loaded.claimed_at_ms, Some(42));

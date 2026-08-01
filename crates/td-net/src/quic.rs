@@ -222,8 +222,8 @@ pub fn load_pem_identity(
 }
 
 /// Generate a self-signed cert for pond QUIC (dev / LAN).
-pub fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), QuicError>
-{
+pub fn self_signed_cert(
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), QuicError> {
     ensure_crypto_provider();
     let key_pair = KeyPair::generate().map_err(|e| QuicError::Tls(e.to_string()))?;
     let mut params = CertificateParams::new(vec!["localhost".into(), "td-pond".into()])
@@ -252,7 +252,10 @@ pub fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer
 }
 
 /// Write a fresh self-signed identity to PEM paths; returns config.
-pub fn write_self_signed_pem(cert_path: &Path, key_path: &Path) -> Result<QuicTlsConfig, QuicError> {
+pub fn write_self_signed_pem(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<QuicTlsConfig, QuicError> {
     let (certs, key) = self_signed_cert()?;
     let cert_pem = {
         let mut out = String::new();
@@ -531,9 +534,10 @@ fn server_config(cfg: &QuicTlsConfig) -> Result<ServerConfig, QuicError> {
 
 fn client_config(cfg: &QuicTlsConfig) -> Result<ClientConfig, QuicError> {
     ensure_crypto_provider();
-    let verifier =
-        PinOrSkipServerVerifier::new(cfg.peer_pins.clone(), cfg.insecure_skip_verify);
-    let builder = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier);
+    let verifier = PinOrSkipServerVerifier::new(cfg.peer_pins.clone(), cfg.insecure_skip_verify);
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
     let mut crypto = if cfg.require_client_auth || !cfg.certs.is_empty() {
         // Always present client identity when we have one (enables mTLS when server asks).
         builder
@@ -599,9 +603,7 @@ pub async fn quic_dial_with_config(
     cfg: &QuicTlsConfig,
 ) -> Result<QuicStream, QuicError> {
     if !uri.quic {
-        return Err(QuicError::InvalidUri(
-            "expected td-quic:// peer uri".into(),
-        ));
+        return Err(QuicError::InvalidUri("expected td-quic:// peer uri".into()));
     }
     let addr: SocketAddr = uri
         .socket_addr()

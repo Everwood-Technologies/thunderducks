@@ -4,6 +4,7 @@
 //! authn** for non-public routes plus **per-IP rate limits**. Optional untrusted
 //! assist relay + advertised host for tailnet/LAN remote access.
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -11,7 +12,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::body::Body;
+use axum_server::tls_rustls::RustlsConfig;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -19,20 +21,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use rand::RngCore;
 use td_crypto::{
     DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
     PasskeyRegistry, RoomOutboundPackage,
 };
-use td_event::{
-    sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
-};
+use td_event::{sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent};
 use td_net::{
     accept_once, dial, noise_read_event, parse_pin_list, quic_accept, quic_dial_with_config,
     quic_listen_with_config, read_event, write_event, write_self_signed_pem, NoiseTcpStream,
     PeerUri, QuicTlsConfig, RelayClient, RelayEnvelope,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
@@ -80,7 +78,9 @@ pub struct ServeOptions {
 impl ServeOptions {
     pub fn from_env() -> Self {
         let data_dir = std::env::var_os("TD_DATA_DIR").map(PathBuf::from);
-        let p2p_bind = std::env::var("TD_P2P_BIND").ok().filter(|s| !s.trim().is_empty());
+        let p2p_bind = std::env::var("TD_P2P_BIND")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let advertise_host = std::env::var("TD_ADVERTISE_HOST")
             .ok()
             .map(|s| s.trim().to_string())
@@ -188,7 +188,10 @@ fn is_loopback_bind(bind: &str) -> bool {
     let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     matches!(host, "127.0.0.1" | "localhost" | "::1")
-        || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 fn advertise_addr(local: SocketAddr, advertise_host: Option<&str>) -> String {
@@ -196,7 +199,9 @@ fn advertise_addr(local: SocketAddr, advertise_host: Option<&str>) -> String {
         // host may be DNS or IP; keep port from actual bind
         if h.contains(':') && !h.starts_with('[') {
             // already host:port or ipv6 without brackets — use as-is if it looks complete
-            if h.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).is_some()
+            if h.rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .is_some()
                 && h.matches(':').count() == 1
             {
                 return h.to_string();
@@ -1074,8 +1079,13 @@ struct ClaimStatusResponse {
 }
 
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
-    let rest = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))?;
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let rest = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))?;
     let t = rest.trim();
     if t.is_empty() {
         None
@@ -1150,10 +1160,7 @@ fn extract_owner_token_flexible(headers: &HeaderMap, query_token: Option<&str>) 
         .map(|s| s.to_string())
 }
 
-fn require_owner_token(
-    g: &mut NodeSession,
-    token: Option<String>,
-) -> Result<(), Box<Response>> {
+fn require_owner_token(g: &mut NodeSession, token: Option<String>) -> Result<(), Box<Response>> {
     let Some(token) = token else {
         return Err(Box::new(
             (
@@ -1300,9 +1307,7 @@ async fn claim_node(
         g.claim = ClaimState::default();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: e,
-            }),
+            Json(ErrorBody { error: e }),
         )
             .into_response();
     }
@@ -1424,10 +1429,7 @@ async fn recovery_login(
     .into_response()
 }
 
-async fn owner_session_status(
-    State(st): State<RpcState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn owner_session_status(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
     let token = extract_owner_token(&headers);
     let (authenticated, source, expires_in_secs) = match token {
@@ -2104,7 +2106,12 @@ async fn add_peer(
     }
     let uri = req.uri.clone().unwrap_or_default();
     g.upsert_peer(&req.name, &uri, req.rpc.as_deref(), req.p2p.as_deref());
-    if let Some(did) = req.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(did) = req
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Some(ep) = g.peers.get_mut(&req.name) {
             ep.device_id = Some(did.to_string());
         }
@@ -2552,7 +2559,6 @@ fn parse_crypto_device_id(s: &str) -> Result<td_crypto::DeviceId, String> {
     Ok(td_crypto::DeviceId(a))
 }
 
-
 #[derive(Debug, Deserialize)]
 struct TrustOlmKeysRequest {
     device_id: String,
@@ -2578,11 +2584,7 @@ async fn trust_olm_keys(
     let peer_dev = match parse_crypto_device_id(&req.device_id) {
         Ok(d) => d,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody { error: e }),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
         }
     };
     let keys = OlmDeviceKeys {
@@ -2894,11 +2896,7 @@ async fn relay_poll_now(State(st): State<RpcState>, headers: HeaderMap) -> impl 
     }
     match poll_relay_once(&st).await {
         Ok(n) => Json(serde_json::json!({"ok": true, "fetched": n})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorBody { error: e }),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorBody { error: e })).into_response(),
     }
 }
 
@@ -2922,14 +2920,9 @@ async fn relay_push_now(State(st): State<RpcState>, headers: HeaderMap) -> impl 
     }
     match push_outbox_to_relay(&st).await {
         Ok(n) => Json(serde_json::json!({"ok": true, "pushed": n})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorBody { error: e }),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorBody { error: e })).into_response(),
     }
 }
-
 
 // --- Appliance: OTA + Wi-Fi wizard (first slice) ---
 
@@ -2983,12 +2976,22 @@ fn load_wifi_state(data: &Option<NodeDataDir>) -> WifiState {
     if let Some(p) = wifi_state_path(data) {
         if let Ok(raw) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                st.ssid = v.get("ssid").and_then(|x| x.as_str()).map(|s| s.to_string());
-                st.has_psk = v.get("psk").and_then(|x| x.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+                st.ssid = v
+                    .get("ssid")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                st.has_psk = v
+                    .get("psk")
+                    .and_then(|x| x.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
                 if let Some(i) = v.get("iface").and_then(|x| x.as_str()) {
                     st.iface = i.to_string();
                 }
-                st.last_apply = v.get("last_apply").and_then(|x| x.as_str()).map(|s| s.to_string());
+                st.last_apply = v
+                    .get("last_apply")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
                 st.last_apply_ok = v.get("last_apply_ok").and_then(|x| x.as_bool());
             }
         }
@@ -2996,7 +2999,14 @@ fn load_wifi_state(data: &Option<NodeDataDir>) -> WifiState {
     st
 }
 
-fn save_wifi_disk(data: &Option<NodeDataDir>, ssid: &str, psk: &str, iface: &str, last_apply: &str, ok: bool) -> Result<(), String> {
+fn save_wifi_disk(
+    data: &Option<NodeDataDir>,
+    ssid: &str,
+    psk: &str,
+    iface: &str,
+    last_apply: &str,
+    ok: bool,
+) -> Result<(), String> {
     let Some(p) = wifi_state_path(data) else {
         return Err("no data dir — wifi config not durable".into());
     };
@@ -3007,8 +3017,11 @@ fn save_wifi_disk(data: &Option<NodeDataDir>, ssid: &str, psk: &str, iface: &str
         "last_apply": last_apply,
         "last_apply_ok": ok,
     });
-    std::fs::write(&p, serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3273,11 +3286,13 @@ fn ota_auto_apply_enabled() -> bool {
 }
 
 fn ota_pending_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
-    data.as_ref().map(|d| d.root().join("ota").join("pending.json"))
+    data.as_ref()
+        .map(|d| d.root().join("ota").join("pending.json"))
 }
 
 fn ota_last_apply_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
-    data.as_ref().map(|d| d.root().join("ota").join("last-apply.json"))
+    data.as_ref()
+        .map(|d| d.root().join("ota").join("last-apply.json"))
 }
 
 async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
@@ -3301,9 +3316,18 @@ async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
         if let Ok(raw) = std::fs::read_to_string(p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 last_check = v.get("last_check_ms").and_then(|x| x.as_u64());
-                last_error = v.get("last_error").and_then(|x| x.as_str()).map(|s| s.to_string());
-                staged = v.get("staged_path").and_then(|x| x.as_str()).map(|s| s.to_string());
-                last_apply = v.get("last_apply").and_then(|x| x.as_str()).map(|s| s.to_string());
+                last_error = v
+                    .get("last_error")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                staged = v
+                    .get("staged_path")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                last_apply = v
+                    .get("last_apply")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
                 last_apply_ok = v.get("last_apply_ok").and_then(|x| x.as_bool());
                 last_apply_ms = v.get("last_apply_ms").and_then(|x| x.as_u64());
                 installed_version = v
@@ -3457,11 +3481,7 @@ async fn ota_check(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
         }
     };
     if let Err(e) = verify_ota_manifest(&manifest) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody { error: e }),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
     }
     let now = now_ms();
     {
@@ -3553,11 +3573,7 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
     drop(g);
 
     if let Err(e) = verify_ota_manifest(&manifest) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody { error: e }),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
     }
 
     let client = match reqwest_client() {
@@ -3655,7 +3671,9 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
     };
 
     let mut apply_mode = "staged";
-    let mut apply_note = "Artifact staged only (TD_OTA_AUTO_APPLY=false). Install manually or enable auto-apply.".to_string();
+    let mut apply_note =
+        "Artifact staged only (TD_OTA_AUTO_APPLY=false). Install manually or enable auto-apply."
+            .to_string();
     let mut pending_written = false;
     let mut helper_started = false;
     let mut helper_error: Option<String> = None;
@@ -3678,7 +3696,8 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o640));
+                let _ =
+                    std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o640));
             }
             apply_mode = "pending";
 
@@ -3730,7 +3749,10 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
             serde_json::Value::Null
         },
     });
-    let _ = std::fs::write(state_path, serde_json::to_vec_pretty(&v).unwrap_or_default());
+    let _ = std::fs::write(
+        state_path,
+        serde_json::to_vec_pretty(&v).unwrap_or_default(),
+    );
     drop(g);
 
     Json(serde_json::json!({
@@ -3976,7 +3998,10 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/claim", get(claim_status).post(claim_node))
         .route("/v1/recovery/login", post(recovery_login))
-        .route("/v1/owner/session", get(owner_session_status).delete(owner_logout))
+        .route(
+            "/v1/owner/session",
+            get(owner_session_status).delete(owner_logout),
+        )
         .route("/v1/pair", get(pair_list).post(pair_create))
         .route("/v1/pair/redeem", post(pair_redeem))
         .route("/v1/devices", get(list_devices))
@@ -4034,7 +4059,9 @@ pub fn new_state() -> RpcState {
 }
 
 /// Build RPC state loading durable identity + claim from `data_dir`.
-pub fn new_state_with_data_dir(data_dir: impl Into<std::path::PathBuf>) -> Result<RpcState, String> {
+pub fn new_state_with_data_dir(
+    data_dir: impl Into<std::path::PathBuf>,
+) -> Result<RpcState, String> {
     new_state_with_options(ServeOptions {
         data_dir: Some(data_dir.into()),
         ..Default::default()
@@ -4286,9 +4313,10 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
     Ok(n)
 }
 
-
-
-fn build_quic_tls_config(opts: &ServeOptions, data_dir: Option<&PathBuf>) -> Result<Option<QuicTlsConfig>, String> {
+fn build_quic_tls_config(
+    opts: &ServeOptions,
+    data_dir: Option<&PathBuf>,
+) -> Result<Option<QuicTlsConfig>, String> {
     if !opts.p2p_quic {
         return Ok(None);
     }
@@ -4377,13 +4405,11 @@ fn generate_self_signed_rpc_cert() -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     let key_pair = KeyPair::generate().map_err(|e| e.to_string())?;
     let mut params = CertificateParams::new(vec!["localhost".into(), "td-pond".into()])
         .map_err(|e| e.to_string())?;
-    params.subject_alt_names.push(
-        SanType::DnsName(
-            "localhost"
-                .try_into()
-                .map_err(|e: rcgen::Error| e.to_string())?,
-        ),
-    );
+    params.subject_alt_names.push(SanType::DnsName(
+        "localhost"
+            .try_into()
+            .map_err(|e: rcgen::Error| e.to_string())?,
+    ));
     params
         .subject_alt_names
         .push(SanType::IpAddress(std::net::IpAddr::V4(
@@ -4420,7 +4446,11 @@ pub async fn serve_with_options(
     opts: ServeOptions,
 ) -> Result<SocketAddr, std::io::Error> {
     let prepared = prepare_serve(bind, opts).await?;
-    let scheme = if prepared.tls.is_some() { "https" } else { "http" };
+    let scheme = if prepared.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     eprintln!(
         "td-node rpc listening on {scheme}://{} p2p={}",
         prepared.addr, prepared.p2p
@@ -4491,7 +4521,11 @@ pub async fn serve_blocking_with_options(
         };
         format!("{data}{relay}{adv}{own}{tls}{p2p_mode}")
     };
-    let scheme = if prepared.tls.is_some() { "https" } else { "http" };
+    let scheme = if prepared.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     eprintln!(
         "td-node rpc listening on {scheme}://{} p2p={}{notes}",
         prepared.addr, prepared.p2p
@@ -4544,7 +4578,8 @@ async fn prepare_serve(bind: &str, opts: ServeOptions) -> Result<PreparedServe, 
         let mut g = state.inner.lock().await;
         g.rpc_tls = https;
         let data_root = g.data_dir.as_ref().map(|d| d.root().to_path_buf());
-        let qcfg = build_quic_tls_config(&opts, data_root.as_ref()).map_err(std::io::Error::other)?;
+        let qcfg =
+            build_quic_tls_config(&opts, data_root.as_ref()).map_err(std::io::Error::other)?;
         if let Some(ref c) = qcfg {
             g.quic_pin = c.local_pin_hex();
         }
@@ -4623,4 +4658,3 @@ pub fn happy_path_script() -> Result<String, String> {
         hex32(&msg.id.0)
     ))
 }
-

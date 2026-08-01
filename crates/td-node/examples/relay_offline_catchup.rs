@@ -196,8 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut c = RelayClient::connect(&relay.uri).await?;
         let items = c.fetch(bob.device_id, 0, 10).await?;
         assert_eq!(items.len(), 1, "bob should see one pending envelope");
-        let opened =
-            DeviceNode::open_from_relay_auto(&mut bob_e2ee, None, &items[0].ciphertext)?;
+        let opened = DeviceNode::open_from_relay_auto(&mut bob_e2ee, None, &items[0].ciphertext)?;
         verify_event(&opened)?;
         assert_eq!(opened.id, offline_msg.id);
         assert_eq!(opened.payload, secret);

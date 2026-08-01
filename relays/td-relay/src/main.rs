@@ -430,8 +430,11 @@ mod tests {
             assert_eq!(items[0].envelope_id, env.envelope_id);
             assert_eq!(items[0].ciphertext, ciphertext);
 
-            // recover signed event locally
-            let recovered: Vec<u8> = items[0].ciphertext.iter().map(|b| b ^ pad).collect();
+            // recover signed event locally (undo test fixture wrapping_add(1) after version/nonce/tag)
+            let ct = &items[0].ciphertext;
+            assert!(ct.len() > 1 + 12 + 16, "fixture ciphertext too short");
+            let body = &ct[1 + 12..ct.len() - 16];
+            let recovered: Vec<u8> = body.iter().map(|b| b.wrapping_sub(1)).collect();
             let ev: td_event::SignedEvent = serde_json::from_slice(&recovered).unwrap();
             td_event::verify_event(&ev).unwrap();
             assert_eq!(ev.payload, plaintext_marker);

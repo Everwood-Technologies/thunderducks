@@ -22,8 +22,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::e2ee::{E2eeDevice, E2eeError, OlmCiphertext};
 use crate::device::DeviceId;
+use crate::e2ee::{E2eeDevice, E2eeError, OlmCiphertext};
 
 /// Domain-separated label for relay seal key derivation.
 pub const RELAY_SEAL_KDF_LABEL: &[u8] = b"td-relay-seal-v1";
@@ -145,26 +145,22 @@ pub fn seal_bytes_olm(
 }
 
 /// Open v2 Olm-sealed bytes addressed to this device.
-pub fn open_bytes_olm(
-    e2ee: &mut E2eeDevice,
-    sealed: &[u8],
-) -> Result<Vec<u8>, RelaySealError> {
+pub fn open_bytes_olm(e2ee: &mut E2eeDevice, sealed: &[u8]) -> Result<Vec<u8>, RelaySealError> {
     if sealed.is_empty() {
         return Err(RelaySealError::TooShort);
     }
     if sealed[0] != RELAY_SEAL_V2_OLM {
         return Err(RelaySealError::BadVersion(sealed[0]));
     }
-    let wire: RelayOlmWire = serde_json::from_slice(&sealed[1..])
-        .map_err(|e| RelaySealError::Codec(e.to_string()))?;
+    let wire: RelayOlmWire =
+        serde_json::from_slice(&sealed[1..]).map_err(|e| RelaySealError::Codec(e.to_string()))?;
     if wire.v != 1 {
         return Err(RelaySealError::Codec(format!(
             "unsupported RelayOlmWire.v={}",
             wire.v
         )));
     }
-    e2ee
-        .olm_decrypt(&wire.sender_curve25519_b64, &wire.olm)
+    e2ee.olm_decrypt(&wire.sender_curve25519_b64, &wire.olm)
         .map_err(Into::into)
 }
 
