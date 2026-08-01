@@ -37,9 +37,15 @@ enum Commands {
         /// Host/IP advertised in rpc_base + p2p_uri (Tailscale IP or DNS).
         #[arg(long, env = "TD_ADVERTISE_HOST")]
         advertise_host: Option<String>,
-        /// Untrusted assist relay URI (td://host:port).
+        /// Untrusted assist relay URI (td://host:port or td-noise://host:port).
         #[arg(long, env = "TD_RELAY_URI")]
         relay_uri: Option<String>,
+        /// Relay AEAD key material (UTF-8 secret or 64-char hex). Derived via blake3.
+        #[arg(long, env = "TD_RELAY_KEY")]
+        relay_key: Option<String>,
+        /// Prefer Noise_XX for P2P (advertise td-noise:// and handshake on accept).
+        #[arg(long, env = "TD_P2P_NOISE", default_value_t = false)]
+        p2p_noise: bool,
         /// Require owner session for non-public routes when bind is non-loopback (default true).
         #[arg(long, env = "TD_REQUIRE_OWNER", default_value_t = true)]
         require_owner: bool,
@@ -94,6 +100,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             p2p_bind,
             advertise_host,
             relay_uri,
+            relay_key,
+            p2p_noise,
             require_owner,
             rate_limit,
         } => {
@@ -111,6 +119,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             if relay_uri.is_some() {
                 opts.relay_uri = relay_uri;
             }
+            if let Some(k) = relay_key {
+                let material = td_crypto::parse_relay_key_material(&k);
+                opts.relay_key = td_crypto::derive_relay_key(&material);
+            }
+            opts.p2p_noise = p2p_noise;
             opts.require_owner_non_loopback = require_owner;
             opts.rate_limit = rate_limit;
             td_node::serve_blocking_with_options(&bind, opts)

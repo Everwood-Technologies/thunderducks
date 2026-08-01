@@ -112,11 +112,15 @@ mod tests {
         node.commit_local(create.clone()).unwrap();
         assert_eq!(node.outbox_len(), 1);
         let ev = node.pop_outbox().unwrap();
-        let pad = 0x3C;
-        let ct = DeviceNode::seal_for_relay(&ev, pad).unwrap();
+        let key = td_crypto::derive_relay_key(b"unit-test-relay-key");
+        let ct = DeviceNode::seal_for_relay(&ev, &key).unwrap();
+        assert_eq!(ct[0], td_crypto::RELAY_SEAL_V1);
         assert!(!ct.windows(2).any(|w| w == b"{}"));
-        let opened = DeviceNode::open_from_relay(&ct, pad).unwrap();
+        let opened = DeviceNode::open_from_relay(&ct, &key).unwrap();
         assert_eq!(opened.id, create.id);
+        // wrong key must fail
+        let bad = td_crypto::derive_relay_key(b"wrong");
+        assert!(DeviceNode::open_from_relay(&ct, &bad).is_err());
     }
 
     #[test]

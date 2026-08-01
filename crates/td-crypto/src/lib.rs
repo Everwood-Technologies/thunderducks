@@ -4,11 +4,16 @@ mod device;
 mod e2ee;
 mod link;
 mod passkey;
+mod relay_seal;
 
 pub use device::{DeviceBundle, DeviceId, DeviceKeypair};
 pub use e2ee::{
     fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
     RoomOutboundPackage, ROOM_PICKLE_KEY,
+};
+pub use relay_seal::{
+    derive_relay_key, open_bytes, parse_relay_key_material, seal_bytes, RelaySealError,
+    DEFAULT_RELAY_KEY_MATERIAL, RELAY_SEAL_V1,
 };
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
 pub use passkey::{

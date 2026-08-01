@@ -33,7 +33,9 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Status |
 |----|------|--------|
-| P3.1 | QUIC transport (TCP framed is MVP fallback) | open |
+| P3.1 | QUIC transport (TCP framed is MVP fallback) | open (Noise_XX TCP done) |
+| P3.1b | **Noise_XX transport** (`td-noise://`, `TD_P2P_NOISE`) | ✅ done |
+| P3.1c | **Production relay seal** (ChaCha20-Poly1305 / `TD_RELAY_KEY`) | ✅ done |
 | P3.2 | **SSE live message push** (`GET /v1/messages/stream`; WS later) | ✅ done (A2) |
 | P3.2b | **Shared room Megolm ownership** (one outbound session/room) | ✅ done (B2) |
 | P3.2c | **Pond packaging** (linux amd64/arm64 release + systemd DIY install) | ✅ done (C) |
@@ -44,6 +46,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.3 | Encrypted history catch-up packaging polish | open |
 | P3.4 | **Full RPC authn + rate limits** (non-loopback owner gate + per-IP limits) | ✅ done |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |
+| P3.5b | **OTA + Wi‑Fi wizard first slice** (`/v1/ota/*`, `/v1/wifi/*`) | ✅ done |
 | P3.6 | Mobile / Tauri (explicitly deferred) |
 | P3.7 | Metadata-privacy hardening (not MVP) |
 

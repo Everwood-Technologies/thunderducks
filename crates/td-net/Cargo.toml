@@ -18,6 +18,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }
+snow = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 td-crypto = { workspace = true }

@@ -18,12 +18,20 @@ pub enum PeerError {
 pub struct PeerUri {
     pub host: String,
     pub port: u16,
+    /// When true, dial/accept should use Noise_XX transport.
+    pub noise: bool,
 }
 
 impl PeerUri {
     pub fn parse(s: &str) -> Result<Self, PeerError> {
-        // td://127.0.0.1:1234 or 127.0.0.1:1234
-        let rest = s.strip_prefix("td://").unwrap_or(s);
+        // td://host:port | td-noise://host:port | host:port
+        let (rest, noise) = if let Some(r) = s.strip_prefix("td-noise://") {
+            (r, true)
+        } else if let Some(r) = s.strip_prefix("td://") {
+            (r, false)
+        } else {
+            (s, false)
+        };
         let (host, port_s) = rest
             .rsplit_once(':')
             .ok_or_else(|| PeerError::InvalidUri(s.to_string()))?;
@@ -33,6 +41,7 @@ impl PeerUri {
         Ok(Self {
             host: host.to_string(),
             port,
+            noise,
         })
     }
 
@@ -40,11 +49,24 @@ impl PeerUri {
         Self {
             host: addr.ip().to_string(),
             port: addr.port(),
+            noise: false,
+        }
+    }
+
+    pub fn from_tcp_addr_noise(addr: SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            noise: true,
         }
     }
 
     pub fn to_string_uri(&self) -> String {
-        format!("td://{}:{}", self.host, self.port)
+        if self.noise {
+            format!("td-noise://{}:{}", self.host, self.port)
+        } else {
+            format!("td://{}:{}", self.host, self.port)
+        }
     }
 
     pub fn socket_addr(&self) -> String {

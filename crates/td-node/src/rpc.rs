@@ -28,7 +28,8 @@ use td_event::{
     sign_event, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
 use td_net::{
-    accept_once, dial, read_event, write_event, PeerUri, RelayClient, RelayEnvelope,
+    accept_once, dial, noise_read_event, read_event, write_event, NoiseTcpStream, PeerUri,
+    RelayClient, RelayEnvelope,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
@@ -38,7 +39,7 @@ use crate::persist::NodeDataDir;
 use crate::sync::{DeviceNode, SyncOffer};
 
 /// Runtime options for serving a Pond node (local or remote-capable).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// Durable identity + claim directory.
     pub data_dir: Option<PathBuf>,
@@ -46,14 +47,16 @@ pub struct ServeOptions {
     pub p2p_bind: Option<String>,
     /// Host/IP advertised in `p2p_uri` / `rpc_base` (e.g. Tailscale IP or DNS name).
     pub advertise_host: Option<String>,
-    /// Optional untrusted assist relay URI (`td://host:port`).
+    /// Optional untrusted assist relay URI (`td://host:port` or `td-noise://…`).
     pub relay_uri: Option<String>,
-    /// XOR pad for MVP relay seal (demo-grade; not production E2EE-at-rest).
-    pub relay_pad: u8,
+    /// 32-byte AEAD key for production relay seal (derived from TD_RELAY_KEY).
+    pub relay_key: [u8; 32],
     /// When RPC is not loopback-only, require owner session for non-public routes.
     pub require_owner_non_loopback: bool,
     /// Enable per-IP rate limits (default true).
     pub rate_limit: bool,
+    /// Prefer Noise_XX for P2P accept/dial when peer URI uses td-noise:// or flag set.
+    pub p2p_noise: bool,
 }
 
 impl ServeOptions {
@@ -68,10 +71,14 @@ impl ServeOptions {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let relay_pad = std::env::var("TD_RELAY_PAD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x3C);
+        let relay_key = {
+            let material = std::env::var("TD_RELAY_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| td_crypto::parse_relay_key_material(&s))
+                .unwrap_or_else(|| td_crypto::DEFAULT_RELAY_KEY_MATERIAL.to_vec());
+            td_crypto::derive_relay_key(&material)
+        };
         // Default on: safer when binding non-loopback.
         let require_owner_non_loopback = std::env::var("TD_REQUIRE_OWNER")
             .map(|v| {
@@ -85,14 +92,36 @@ impl ServeOptions {
                 !(v == "0" || v == "false" || v == "off" || v == "no")
             })
             .unwrap_or(true);
+        let p2p_noise = std::env::var("TD_P2P_NOISE")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false);
         Self {
             data_dir,
             p2p_bind,
             advertise_host,
             relay_uri,
-            relay_pad,
+            relay_key,
             require_owner_non_loopback,
             rate_limit,
+            p2p_noise,
+        }
+    }
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            data_dir: None,
+            p2p_bind: None,
+            advertise_host: None,
+            relay_uri: None,
+            relay_key: td_crypto::derive_relay_key(td_crypto::DEFAULT_RELAY_KEY_MATERIAL),
+            require_owner_non_loopback: true,
+            rate_limit: true,
+            p2p_noise: false,
         }
     }
 }
@@ -124,12 +153,13 @@ fn advertise_http_base(local: SocketAddr, advertise_host: Option<&str>) -> Strin
     format!("http://{}", advertise_addr(local, advertise_host))
 }
 
-fn advertise_p2p_uri(local: SocketAddr, advertise_host: Option<&str>) -> String {
+fn advertise_p2p_uri(local: SocketAddr, advertise_host: Option<&str>, noise: bool) -> String {
     let adv = advertise_addr(local, advertise_host);
-    if adv.starts_with("td://") {
+    let scheme = if noise { "td-noise" } else { "td" };
+    if adv.starts_with("td://") || adv.starts_with("td-noise://") {
         adv
     } else {
-        format!("td://{adv}")
+        format!("{scheme}://{adv}")
     }
 }
 
@@ -328,10 +358,12 @@ struct NodeSession {
     data_dir: Option<NodeDataDir>,
     /// Advertised public/tailnet host for URI rewriting.
     advertise_host: Option<String>,
-    /// Configured untrusted assist relay (`td://…`).
+    /// Configured untrusted assist relay (`td://…` / `td-noise://…`).
     relay_uri: Option<String>,
-    /// MVP relay seal pad.
-    relay_pad: u8,
+    /// Production AEAD relay seal key.
+    relay_key: [u8; 32],
+    /// Prefer Noise for P2P.
+    p2p_noise: bool,
     /// Last relay poll summary (best-effort).
     relay_last_fetch_ms: Option<u64>,
     relay_last_error: Option<String>,
@@ -372,7 +404,8 @@ impl NodeSession {
             data_dir,
             advertise_host: None,
             relay_uri: None,
-            relay_pad: 0x3C,
+            relay_key: td_crypto::derive_relay_key(td_crypto::DEFAULT_RELAY_KEY_MATERIAL),
+            p2p_noise: false,
             relay_last_fetch_ms: None,
             relay_last_error: None,
             relay_last_fetched: 0,
@@ -386,7 +419,8 @@ impl NodeSession {
         if let Some(r) = opts.relay_uri.clone() {
             self.relay_uri = Some(r);
         }
-        self.relay_pad = opts.relay_pad;
+        self.relay_key = opts.relay_key;
+        self.p2p_noise = opts.p2p_noise;
     }
 
     fn load_from_data_dir(dir: NodeDataDir) -> Result<Self, String> {
@@ -2583,6 +2617,8 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
         "relay_last_fetched": g.relay_last_fetched,
         "require_owner": st.require_owner,
         "rate_limit": st.rate_limit_enabled,
+        "p2p_noise": g.p2p_noise,
+        "relay_seal": "chacha20poly1305-v1",
         "peers": g.peers.values().collect::<Vec<_>>(),
     }))
     .into_response()
@@ -2648,6 +2684,632 @@ async fn relay_push_now(State(st): State<RpcState>, headers: HeaderMap) -> impl 
     }
 }
 
+
+// --- Appliance: OTA + Wi-Fi wizard (first slice) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WifiState {
+    /// Configured SSID (never stores PSK in status responses).
+    ssid: Option<String>,
+    /// true if a PSK is stored (disk or memory).
+    has_psk: bool,
+    /// last apply result message
+    last_apply: Option<String>,
+    last_apply_ok: Option<bool>,
+    /// Interface name hint (nl80211 later)
+    iface: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OtaManifest {
+    /// Semver or git describe of available update.
+    version: String,
+    /// Download URL for release tarball (signed channel later).
+    url: String,
+    /// Optional sha256 hex of artifact.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// Optional ed25519 signature over "{version}\\n{url}\\n{sha256}" (hex).
+    #[serde(default)]
+    signature: Option<String>,
+    /// Channel name (stable/beta).
+    #[serde(default = "default_ota_channel")]
+    channel: String,
+}
+
+fn default_ota_channel() -> String {
+    "stable".into()
+}
+
+fn wifi_state_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
+    data.as_ref().map(|d| d.root().join("wifi.json"))
+}
+
+fn ota_state_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
+    data.as_ref().map(|d| d.root().join("ota-state.json"))
+}
+
+fn load_wifi_state(data: &Option<NodeDataDir>) -> WifiState {
+    let mut st = WifiState {
+        iface: std::env::var("TD_WIFI_IFACE").unwrap_or_else(|_| "wlan0".into()),
+        ..Default::default()
+    };
+    if let Some(p) = wifi_state_path(data) {
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                st.ssid = v.get("ssid").and_then(|x| x.as_str()).map(|s| s.to_string());
+                st.has_psk = v.get("psk").and_then(|x| x.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+                if let Some(i) = v.get("iface").and_then(|x| x.as_str()) {
+                    st.iface = i.to_string();
+                }
+                st.last_apply = v.get("last_apply").and_then(|x| x.as_str()).map(|s| s.to_string());
+                st.last_apply_ok = v.get("last_apply_ok").and_then(|x| x.as_bool());
+            }
+        }
+    }
+    st
+}
+
+fn save_wifi_disk(data: &Option<NodeDataDir>, ssid: &str, psk: &str, iface: &str, last_apply: &str, ok: bool) -> Result<(), String> {
+    let Some(p) = wifi_state_path(data) else {
+        return Err("no data dir — wifi config not durable".into());
+    };
+    let v = serde_json::json!({
+        "ssid": ssid,
+        "psk": psk,
+        "iface": iface,
+        "last_apply": last_apply,
+        "last_apply_ok": ok,
+    });
+    std::fs::write(&p, serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+async fn wifi_status(State(st): State<RpcState>) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    let wifi = load_wifi_state(&g.data_dir);
+    Json(serde_json::json!({
+        "ok": true,
+        "ssid": wifi.ssid,
+        "has_psk": wifi.has_psk,
+        "iface": wifi.iface,
+        "last_apply": wifi.last_apply,
+        "last_apply_ok": wifi.last_apply_ok,
+        "backend": "nmcli-or-stub",
+        "note": "First slice: stores config + best-effort nmcli apply when available",
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WifiScanRequest {
+    #[serde(default)]
+    iface: Option<String>,
+}
+
+async fn wifi_scan(
+    State(st): State<RpcState>,
+    headers: HeaderMap,
+    Json(req): Json<WifiScanRequest>,
+) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+            if st.require_owner {
+                return *resp;
+            }
+        }
+    }
+    let iface = req
+        .iface
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| std::env::var("TD_WIFI_IFACE").unwrap_or_else(|_| "wlan0".into()));
+    // Best-effort nmcli; fall back to empty list with note.
+    let output = tokio::process::Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "SSID,SIGNAL,SECURITY,BARS",
+            "dev",
+            "wifi",
+            "list",
+            "ifname",
+            &iface,
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut networks = Vec::new();
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.is_empty() || parts[0].is_empty() {
+                    continue;
+                }
+                networks.push(serde_json::json!({
+                    "ssid": parts[0],
+                    "signal": parts.get(1).copied().unwrap_or(""),
+                    "security": parts.get(2).copied().unwrap_or(""),
+                    "bars": parts.get(3).copied().unwrap_or(""),
+                }));
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "iface": iface,
+                "networks": networks,
+                "backend": "nmcli",
+            }))
+            .into_response()
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Json(serde_json::json!({
+                "ok": true,
+                "iface": iface,
+                "networks": [],
+                "backend": "stub",
+                "note": if err.is_empty() { "nmcli unavailable or no wifi device".into() } else { err },
+            }))
+            .into_response()
+        }
+        Err(e) => Json(serde_json::json!({
+            "ok": true,
+            "iface": iface,
+            "networks": [],
+            "backend": "stub",
+            "note": format!("nmcli not found: {e}"),
+        }))
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WifiApplyRequest {
+    ssid: String,
+    #[serde(default)]
+    psk: Option<String>,
+    #[serde(default)]
+    iface: Option<String>,
+}
+
+async fn wifi_apply(
+    State(st): State<RpcState>,
+    headers: HeaderMap,
+    Json(req): Json<WifiApplyRequest>,
+) -> impl IntoResponse {
+    let ssid = req.ssid.trim().to_string();
+    if ssid.is_empty() || ssid.len() > 32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "ssid required (1-32 chars)".into(),
+            }),
+        )
+            .into_response();
+    }
+    let psk = req.psk.unwrap_or_default();
+    let iface = req
+        .iface
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| std::env::var("TD_WIFI_IFACE").unwrap_or_else(|_| "wlan0".into()));
+
+    {
+        let mut g = st.inner.lock().await;
+        // Always require owner for wifi apply (credential write).
+        if let Err(resp) = require_owner(&mut g, &headers) {
+            return *resp;
+        }
+        if let Err(e) = save_wifi_disk(&g.data_dir, &ssid, &psk, &iface, "pending", false) {
+            // allow in-memory-only when no data dir
+            if g.data_dir.is_some() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody { error: e }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Best-effort NetworkManager apply.
+    let mut cmd = tokio::process::Command::new("nmcli");
+    cmd.args(["dev", "wifi", "connect", &ssid, "ifname", &iface]);
+    if !psk.is_empty() {
+        cmd.args(["password", &psk]);
+    }
+    let apply = cmd.output().await;
+    let (ok, msg) = match apply {
+        Ok(out) if out.status.success() => {
+            let m = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (true, if m.is_empty() { "connected".into() } else { m })
+        }
+        Ok(out) => {
+            let m = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            (
+                false,
+                if m.is_empty() {
+                    format!("nmcli exit {}", out.status)
+                } else {
+                    m
+                },
+            )
+        }
+        Err(e) => (
+            false,
+            format!("nmcli not available ({e}); config saved for later apply"),
+        ),
+    };
+
+    {
+        let g = st.inner.lock().await;
+        let _ = save_wifi_disk(&g.data_dir, &ssid, &psk, &iface, &msg, ok);
+    }
+
+    Json(serde_json::json!({
+        "ok": ok,
+        "ssid": ssid,
+        "iface": iface,
+        "message": msg,
+        "persisted": true,
+    }))
+    .into_response()
+}
+
+fn current_package_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn ota_channel() -> String {
+    std::env::var("TD_OTA_CHANNEL").unwrap_or_else(|_| "stable".into())
+}
+
+fn ota_manifest_url() -> Option<String> {
+    std::env::var("TD_OTA_MANIFEST_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn ota_pubkey() -> Option<[u8; 32]> {
+    let s = std::env::var("TD_OTA_PUBKEY").ok()?;
+    let t = s.trim();
+    if t.len() != 64 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn verify_ota_manifest(m: &OtaManifest) -> Result<(), String> {
+    let Some(pk) = ota_pubkey() else {
+        // No pubkey configured → accept unsigned manifests (dev).
+        return Ok(());
+    };
+    let Some(sig_hex) = m.signature.as_deref() else {
+        return Err("manifest missing signature (TD_OTA_PUBKEY set)".into());
+    };
+    if sig_hex.len() != 128 || !sig_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid signature hex".into());
+    }
+    let mut sig = [0u8; 64];
+    for i in 0..64 {
+        sig[i] = u8::from_str_radix(&sig_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "bad sig hex".to_string())?;
+    }
+    let sha = m.sha256.clone().unwrap_or_default();
+    let msg = format!("{}\n{}\n{}", m.version, m.url, sha);
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let vk = VerifyingKey::from_bytes(&pk).map_err(|e| e.to_string())?;
+    let signature = Signature::from_bytes(&sig);
+    vk.verify(msg.as_bytes(), &signature)
+        .map_err(|_| "OTA manifest signature invalid".to_string())
+}
+
+async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    let mut available = None;
+    let mut last_check = None;
+    let mut last_error = None;
+    let mut staged = None;
+    if let Some(p) = ota_state_path(&g.data_dir) {
+        if let Ok(raw) = std::fs::read_to_string(p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                last_check = v.get("last_check_ms").and_then(|x| x.as_u64());
+                last_error = v.get("last_error").and_then(|x| x.as_str()).map(|s| s.to_string());
+                staged = v.get("staged_path").and_then(|x| x.as_str()).map(|s| s.to_string());
+                if let Some(a) = v.get("available") {
+                    available = serde_json::from_value::<OtaManifest>(a.clone()).ok();
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "current_version": current_package_version(),
+        "channel": ota_channel(),
+        "manifest_url": ota_manifest_url(),
+        "signature_required": ota_pubkey().is_some(),
+        "last_check_ms": last_check,
+        "available": available,
+        "staged_path": staged,
+        "last_error": last_error,
+    }))
+    .into_response()
+}
+
+async fn ota_check(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner(&mut g, &headers) {
+            return *resp;
+        }
+    }
+    let Some(url) = ota_manifest_url() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "TD_OTA_MANIFEST_URL not configured".into(),
+            }),
+        )
+            .into_response();
+    };
+    let client = match reqwest_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody { error: e }),
+            )
+                .into_response();
+        }
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("manifest fetch failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if !resp.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody {
+                error: format!("manifest HTTP {}", resp.status()),
+            }),
+        )
+            .into_response();
+    }
+    let manifest: OtaManifest = match resp.json().await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("manifest decode: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = verify_ota_manifest(&manifest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: e }),
+        )
+            .into_response();
+    }
+    let now = now_ms();
+    {
+        let g = st.inner.lock().await;
+        if let Some(p) = ota_state_path(&g.data_dir) {
+            let v = serde_json::json!({
+                "last_check_ms": now,
+                "available": manifest,
+                "last_error": null,
+            });
+            let _ = std::fs::write(p, serde_json::to_vec_pretty(&v).unwrap_or_default());
+        }
+    }
+    let newer = manifest.version != current_package_version();
+    Json(serde_json::json!({
+        "ok": true,
+        "current_version": current_package_version(),
+        "available": manifest,
+        "update_available": newer,
+        "checked_at_ms": now,
+    }))
+    .into_response()
+}
+
+async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoResponse {
+    {
+        let mut g = st.inner.lock().await;
+        if let Err(resp) = require_owner(&mut g, &headers) {
+            return *resp;
+        }
+    }
+    // First slice: download artifact to data dir staging; operator restarts / install script applies.
+    let g = st.inner.lock().await;
+    let Some(dir) = g.data_dir.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "data dir required for OTA staging".into(),
+            }),
+        )
+            .into_response();
+    };
+    let state_path = dir.root().join("ota-state.json");
+    let raw = match std::fs::read_to_string(&state_path) {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "run POST /v1/ota/check first".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(avail) = v.get("available").cloned() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "no available update in ota-state".into(),
+            }),
+        )
+            .into_response();
+    };
+    let manifest: OtaManifest = match serde_json::from_value(avail) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    drop(g);
+
+    if let Err(e) = verify_ota_manifest(&manifest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: e }),
+        )
+            .into_response();
+    }
+
+    let client = match reqwest_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody { error: e }),
+            )
+                .into_response();
+        }
+    };
+    let bytes = match client.get(&manifest.url).send().await {
+        Ok(r) if r.status().is_success() => match r.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorBody {
+                        error: format!("download body: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        Ok(r) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("download HTTP {}", r.status()),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("download failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(want) = manifest.sha256.as_deref() {
+        // Field name historical; value is blake3 hex of artifact bytes.
+        let got = hex::encode(blake3::hash(&bytes).as_bytes());
+        let want = want.trim().to_ascii_lowercase();
+        if want != got {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "artifact hash mismatch (expected blake3 hex)".into(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let g = st.inner.lock().await;
+    let stage_dir = g.data_dir.as_ref().unwrap().root().join("ota");
+    if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let stage_path = stage_dir.join(format!("tducks-{}.bin", manifest.version));
+    if let Err(e) = std::fs::write(&stage_path, &bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let staged = stage_path.display().to_string();
+    let state_path = g.data_dir.as_ref().unwrap().root().join("ota-state.json");
+    let v = serde_json::json!({
+        "last_check_ms": now_ms(),
+        "available": manifest,
+        "staged_path": staged,
+        "last_error": null,
+        "last_apply": "staged — run install script or restart with new binary",
+    });
+    let _ = std::fs::write(state_path, serde_json::to_vec_pretty(&v).unwrap_or_default());
+
+    Json(serde_json::json!({
+        "ok": true,
+        "staged_path": staged,
+        "version": manifest.version,
+        "bytes": bytes.len(),
+        "note": "Artifact staged. Apply with install-tducks.sh --from-file or operator swap + systemctl restart.",
+    }))
+    .into_response()
+}
+
 /// Build the localhost RPC router.
 pub fn router(state: RpcState) -> Router {
     let cors = CorsLayer::new()
@@ -2693,6 +3355,12 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/remote", get(remote_status))
         .route("/v1/relay/poll", post(relay_poll_now))
         .route("/v1/relay/push", post(relay_push_now))
+        .route("/v1/wifi", get(wifi_status))
+        .route("/v1/wifi/scan", post(wifi_scan))
+        .route("/v1/wifi/apply", post(wifi_apply))
+        .route("/v1/ota", get(ota_status))
+        .route("/v1/ota/check", post(ota_check))
+        .route("/v1/ota/apply", post(ota_apply))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authn_rate_middleware,
@@ -2744,7 +3412,11 @@ async fn start_p2p_listener(
 ) -> Result<String, std::io::Error> {
     let listener = TcpListener::bind(p2p_bind).await?;
     let addr = listener.local_addr()?;
-    let uri = advertise_p2p_uri(addr, advertise_host);
+    let noise = {
+        let g = state.inner.lock().await;
+        g.p2p_noise
+    };
+    let uri = advertise_p2p_uri(addr, advertise_host, noise);
     {
         let mut g = state.inner.lock().await;
         g.p2p_uri = Some(uri.clone());
@@ -2752,20 +3424,38 @@ async fn start_p2p_listener(
     let st = state.clone();
     tokio::spawn(async move {
         loop {
-            let mut sock = match accept_once(&listener).await {
+            let sock = match accept_once(&listener).await {
                 Ok(s) => s,
                 Err(_) => break,
             };
             let st2 = st.clone();
             tokio::spawn(async move {
-                while let Ok(ev) = read_event(&mut sock).await {
-                    let room_id = ev.room_id;
-                    let inserted = {
-                        let mut g = st2.inner.lock().await;
-                        g.ingest_remote(ev).unwrap_or(false)
+                if noise {
+                    let mut ns = match NoiseTcpStream::handshake_responder(sock).await {
+                        Ok(s) => s,
+                        Err(_) => return,
                     };
-                    if inserted {
-                        notify_room_from_id(&st2, &room_id).await;
+                    while let Ok(ev) = noise_read_event(&mut ns).await {
+                        let room_id = ev.room_id;
+                        let inserted = {
+                            let mut g = st2.inner.lock().await;
+                            g.ingest_remote(ev).unwrap_or(false)
+                        };
+                        if inserted {
+                            notify_room_from_id(&st2, &room_id).await;
+                        }
+                    }
+                } else {
+                    let mut sock = sock;
+                    while let Ok(ev) = read_event(&mut sock).await {
+                        let room_id = ev.room_id;
+                        let inserted = {
+                            let mut g = st2.inner.lock().await;
+                            g.ingest_remote(ev).unwrap_or(false)
+                        };
+                        if inserted {
+                            notify_room_from_id(&st2, &room_id).await;
+                        }
                     }
                 }
             });
@@ -2775,13 +3465,13 @@ async fn start_p2p_listener(
 }
 
 async fn poll_relay_once(state: &RpcState) -> Result<u32, String> {
-    let (relay_uri, pad, device_id) = {
+    let (relay_uri, key, device_id) = {
         let g = state.inner.lock().await;
         let uri = g
             .relay_uri
             .clone()
             .ok_or_else(|| "no relay configured".to_string())?;
-        (uri, g.relay_pad, g.keypair.event_device_id())
+        (uri, g.relay_key, g.keypair.event_device_id())
     };
     let peer = PeerUri::parse(&relay_uri).map_err(|e| e.to_string())?;
     let mut client = RelayClient::connect(&peer)
@@ -2794,7 +3484,7 @@ async fn poll_relay_once(state: &RpcState) -> Result<u32, String> {
     let mut acked = Vec::new();
     let mut inserted = 0u32;
     for env in items {
-        match DeviceNode::open_from_relay(&env.ciphertext, pad) {
+        match DeviceNode::open_from_relay(&env.ciphertext, &key) {
             Ok(ev) => {
                 let room_id = ev.room_id;
                 let ok = {
@@ -2852,13 +3542,13 @@ fn spawn_relay_poller(state: RpcState) {
 /// is not available yet; MVP push is explicit via outbox for linked secondary device ids
 /// stored in link registry (best-effort assist).
 async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
-    let (relay_uri, pad, sender, recipients, events) = {
+    let (relay_uri, key, sender, recipients, events) = {
         let mut g = state.inner.lock().await;
         let uri = g
             .relay_uri
             .clone()
             .ok_or_else(|| "no relay configured".to_string())?;
-        let pad = g.relay_pad;
+        let key = g.relay_key;
         let sender = g.keypair.event_device_id();
         let recipients: Vec<td_event::DeviceId> = g
             .link
@@ -2875,7 +3565,7 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
                 None => break,
             }
         }
-        (uri, pad, sender, recipients, events)
+        (uri, key, sender, recipients, events)
     };
     if events.is_empty() || recipients.is_empty() {
         return Ok(0);
@@ -2886,7 +3576,7 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
         .map_err(|e| e.to_string())?;
     let mut n = 0u32;
     for ev in events {
-        let ct = DeviceNode::seal_for_relay(&ev, pad).map_err(|e| e.to_string())?;
+        let ct = DeviceNode::seal_for_relay(&ev, &key).map_err(|e| e.to_string())?;
         for recip in &recipients {
             let env = RelayEnvelope::new(
                 *recip,

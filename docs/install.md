@@ -154,9 +154,10 @@ Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
 
 Pair tokens remain short-lived and in-memory by design.
 
-**Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + optional relay; owner gate off-loopback).
+**Remote access:** [`remote-access.md`](./remote-access.md) (tailnet advertise + AEAD relay + optional Noise).
 
-**Still later Pond phases:** production relay seal, transport TLS/Noise, OTA, Wi‑Fi wizard.
+**Appliance:** OTA + Wi‑Fi first slice — [`ota-wifi.md`](./ota-wifi.md).  
+**Transport / seal:** Noise_XX + ChaCha20-Poly1305 relay seal — [`remote-access.md`](./remote-access.md).
 
 ## Security notes
 

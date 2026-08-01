@@ -399,9 +399,12 @@ mod tests {
         )
         .unwrap();
         let inner = serde_json::to_vec(&signed).unwrap();
-        // Pretend E2EE: XOR pad so plaintext marker is not visible in ciphertext
-        let pad = 0xA5u8;
-        let ciphertext: Vec<u8> = inner.iter().map(|b| b ^ pad).collect();
+        // Opaque ciphertext fixture (production clients use ChaCha20-Poly1305 seal).
+        let mut ciphertext = Vec::with_capacity(1 + 12 + inner.len() + 16);
+        ciphertext.push(0x01);
+        ciphertext.extend_from_slice(&[0u8; 12]); // fake nonce
+        ciphertext.extend_from_slice(&inner.iter().map(|b| b.wrapping_add(1)).collect::<Vec<_>>());
+        ciphertext.extend_from_slice(&[0u8; 16]); // fake tag
         assert!(
             !ciphertext
                 .windows(plaintext_marker.len())

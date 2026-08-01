@@ -35,7 +35,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
 hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
 bytes = "1"
 tracing = "0.1"
 vodozemac = "0.10"
@@ -46,6 +46,9 @@ tower = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
+aead = { version = "0.5", features = ["std"] }
+snow = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

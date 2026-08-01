@@ -110,6 +110,7 @@ fn spawn_relay_binary() -> Result<RelayProc, Box<dyn std::error::Error>> {
     let uri = PeerUri {
         host: "127.0.0.1".into(),
         port,
+        noise: false,
     };
     Ok(RelayProc { child, uri, db })
 }
@@ -135,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut alice = DeviceNode::from_crypto_device(alice_kp.device_id());
     let mut bob = DeviceNode::from_crypto_device(bob_kp.device_id());
     let room = RoomId::from_bytes([0xB0; 32]);
-    let pad = 0xA5u8;
+    let key = td_crypto::derive_relay_key(b"relay-offline-catchup-demo");
     let secret = b"OFFLINE_CATCHUP_SECRET_HONK";
 
     let create = sign_event(
@@ -167,7 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     alice.commit_local(offline_msg.clone())?;
 
     // Alice cannot reach Bob (Bob offline) → seal + put on relay.
-    let ciphertext = DeviceNode::seal_for_relay(&offline_msg, pad)?;
+    let ciphertext = DeviceNode::seal_for_relay(&offline_msg, &key)?;
+    assert_eq!(ciphertext[0], td_crypto::RELAY_SEAL_V1);
     assert!(
         !ciphertext.windows(secret.len()).any(|w| w == secret),
         "ciphertext must hide plaintext marker"
@@ -189,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut c = RelayClient::connect(&relay.uri).await?;
         let items = c.fetch(bob.device_id, 0, 10).await?;
         assert_eq!(items.len(), 1, "bob should see one pending envelope");
-        let opened = DeviceNode::open_from_relay(&items[0].ciphertext, pad)?;
+        let opened = DeviceNode::open_from_relay(&items[0].ciphertext, &key)?;
         verify_event(&opened)?;
         assert_eq!(opened.id, offline_msg.id);
         assert_eq!(opened.payload, secret);

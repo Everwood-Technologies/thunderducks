@@ -25,6 +25,8 @@ pub enum SyncError {
     UnknownRoom(RoomId),
     #[error("decode envelope: {0}")]
     Decode(String),
+    #[error("relay seal: {0}")]
+    RelaySeal(String),
 }
 
 /// Wire bundle for tip-based catch-up (plaintext at device boundary only).
@@ -231,13 +233,34 @@ impl DeviceNode {
     }
 
     /// Encode a signed event as opaque relay ciphertext (device-side).
-    /// MVP uses a trivial stream XOR — real path wraps Megolm/Olm ciphertext.
-    pub fn seal_for_relay(ev: &SignedEvent, pad: u8) -> Result<Vec<u8>, SyncError> {
+    ///
+    /// Production path: ChaCha20-Poly1305 AEAD (`td_crypto::seal_bytes`) with a
+    /// 32-byte key shared among linked devices (`TD_RELAY_KEY`).
+    pub fn seal_for_relay(ev: &SignedEvent, key: &[u8; 32]) -> Result<Vec<u8>, SyncError> {
+        let raw = serde_json::to_vec(ev)?;
+        td_crypto::seal_bytes(key, &raw).map_err(|e| SyncError::RelaySeal(e.to_string()))
+    }
+
+    /// Open sealed relay ciphertext and verify the signed event.
+    pub fn open_from_relay(ciphertext: &[u8], key: &[u8; 32]) -> Result<SignedEvent, SyncError> {
+        let raw = td_crypto::open_bytes(key, ciphertext)
+            .map_err(|e| SyncError::RelaySeal(e.to_string()))?;
+        let ev: SignedEvent =
+            serde_json::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;
+        verify_event(&ev)?;
+        Ok(ev)
+    }
+
+    /// Legacy XOR-pad seal (tests / migration only). Prefer [`seal_for_relay`].
+    #[deprecated(note = "use seal_for_relay with AEAD key")]
+    pub fn seal_for_relay_xor(ev: &SignedEvent, pad: u8) -> Result<Vec<u8>, SyncError> {
         let raw = serde_json::to_vec(ev)?;
         Ok(raw.into_iter().map(|b| b ^ pad).collect())
     }
 
-    pub fn open_from_relay(ciphertext: &[u8], pad: u8) -> Result<SignedEvent, SyncError> {
+    /// Legacy XOR-pad open (tests / migration only).
+    #[deprecated(note = "use open_from_relay with AEAD key")]
+    pub fn open_from_relay_xor(ciphertext: &[u8], pad: u8) -> Result<SignedEvent, SyncError> {
         let raw: Vec<u8> = ciphertext.iter().map(|b| b ^ pad).collect();
         let ev: SignedEvent =
             serde_json::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;

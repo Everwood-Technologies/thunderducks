@@ -1,14 +1,20 @@
 //! Framed P2P event exchange + opaque relay assist protocol (Waves B3 + D1).
 //!
-//! QUIC/Noise come later; MVP path is length-prefixed JSON frames
-//! on localhost/manual peer URI (`td://host:port`).
+//! Transport: optional **Noise_XX** (`td-noise://` / `noise=1`) over TCP; plain
+//! length-prefixed JSON remains the default for localhost/DIY.
+//! QUIC still later.
 
 mod frame;
+mod noise;
 mod peer;
 mod relay_client;
 mod relay_proto;
 
 pub use frame::{read_event, write_event, FrameError};
+pub use noise::{
+    noise_read_event, noise_read_json, noise_write_event, noise_write_json, NoiseError,
+    NoiseTcpStream,
+};
 pub use peer::{accept_once, dial, serve_exchange, PeerError, PeerUri};
 pub use relay_client::{RelayClient, RelayClientError};
 pub use relay_proto::{

@@ -27,6 +27,7 @@ tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-stream = "0.3"
 rand = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

@@ -15,7 +15,7 @@
 |------|-----|----------|--------|
 | **Local only** (default) | DIY install | `127.0.0.1:8788` | Safest; web on same host or SSH tunnel |
 | **Tailnet / LAN** | Tailscale (or similar) + advertise host | often still loopback + reverse proxy, or `0.0.0.0` on tailnet NIC | Set `TD_ADVERTISE_HOST` to tailnet IP/DNS |
-| **Relay assist** | `td-relay` + `TD_RELAY_URI` | unchanged | Opaque envelopes; MVP seal is XOR-pad (demo-grade) |
+| **Relay assist** | `td-relay` + `TD_RELAY_URI` | unchanged | Opaque envelopes; **ChaCha20-Poly1305** AEAD seal (`TD_RELAY_KEY`) |
 
 Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner-session gating turns on for admin mutations.
 
@@ -27,8 +27,9 @@ Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner
 | `TD_DATA_DIR` / `--data-dir` | Durable identity + claim |
 | `TD_P2P_BIND` / `--p2p-bind` | P2P listen (default `127.0.0.1:0`) — use `0.0.0.0:0` for LAN/tailnet peers |
 | `TD_ADVERTISE_HOST` / `--advertise-host` | Host/IP rewritten into `rpc_base` + `p2p_uri` |
-| `TD_RELAY_URI` / `--relay-uri` | Assist relay `td://host:port` |
-| `TD_RELAY_PAD` | MVP seal pad byte (default `0x3C`) — shared demo secret, not real E2EE |
+| `TD_RELAY_URI` / `--relay-uri` | Assist relay `td://host:port` or `td-noise://host:port` |
+| `TD_RELAY_KEY` / `--relay-key` | AEAD seal key material (UTF-8 or 64-hex); derived via blake3 domain sep |
+| `TD_P2P_NOISE` / `--p2p-noise` | Advertise `td-noise://` + Noise_XX on P2P accept (default **false**) |
 | `TD_REQUIRE_OWNER` / `--require-owner` | When bind is **non-loopback**, require owner session for **non-public** routes (default **true**) |
 | `TD_RATE_LIMIT` / `--rate-limit` | Per-IP sliding-window rate limits (default **true**) |
 
@@ -38,6 +39,8 @@ export TD_DATA_DIR=/var/lib/thunderducks
 export TD_ADVERTISE_HOST=100.x.y.z
 export TD_P2P_BIND=0.0.0.0:0
 export TD_RELAY_URI=td://relay.example:7700
+export TD_RELAY_KEY='long-random-shared-secret'
+# optional: TD_P2P_NOISE=true
 tducks serve --bind 127.0.0.1:8788 --data-dir "$TD_DATA_DIR"
 ```
 
@@ -85,7 +88,7 @@ Auth: `Authorization: Bearer <owner_token>` or `x-td-owner-token`. SSE may pass 
 
 Exceeding → `429` + `Retry-After`. Toggle with `TD_RATE_LIMIT=false` for local load tests only.
 
-Still not transport auth (TLS/Noise) — keep the bind private (tailnet/LAN).
+P2P/relay can use **Noise_XX** (`td-noise://` / `TD_P2P_NOISE`). Keep RPC bind private (tailnet/LAN); HTTP RPC is still not TLS-terminated in-process.
 
 ## Tailnet recipe (recommended)
 
@@ -108,9 +111,10 @@ export TD_RELAY_URI=td://relay.example.com:7700
 
 Honest limits:
 
-- Relay never sees room plaintext API, but MVP seal is **XOR-pad** over signed JSON — fine for harness/interop, **not** production confidentiality vs a curious relay operator.
-- No transport TLS/Noise yet (P3.1).
+- Relay never sees room plaintext API; device-side seal is **ChaCha20-Poly1305** with `TD_RELAY_KEY` (shared among linked devices — not per-recipient Olm wrap yet).
+- Noise_XX available for P2P; QUIC still later. HTTP RPC TLS is terminate-at-proxy / tailscale serve.
 - Pair links still embed RPC base; use advertise host + recovery unlock on the client.
+- OTA / Wi‑Fi: see [`ota-wifi.md`](./ota-wifi.md).
 
 ## Operator check
 
