@@ -299,9 +299,14 @@ Current repo: strong node MVP; **packaging + claim UX + remote path** are the ga
 
 ---
 
-## Next engineering slice (when ready)
+## Engineering slices
 
-**C — packaging:** `amd64`/`arm64` release artifacts + `tducks.service` + one-line DIY install — unblocks every SKU above without buying plastic.
+| Slice | Status |
+|-------|--------|
+| **C — packaging** | ✅ `docs/install.md`, `scripts/install-tducks.sh`, `packaging/systemd/tducks.service`, `.github/workflows/release.yml` (tag `v*`) |
+| **P2 — claim wizard + pairing** | next product UX |
+| **Remote both (tailnet + relay UX)** | locked product-wise; implement after claim |
+| **OTA / retail image** | after DIY install is boring |
 
 ---
 

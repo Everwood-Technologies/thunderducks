@@ -45,7 +45,26 @@ scripts/
   dev-harness.sh
   two-user-p2p.sh
   relay-offline-catchup.sh
+  install-tducks.sh   Pond DIY systemd install
+  package-release.sh  local release tarball
+packaging/
+  systemd/tducks.service
+  tducks.env.example
 ```
+
+## Install node (Pond DIY)
+
+Linux amd64/arm64 + systemd — see [`docs/install.md`](./docs/install.md).
+
+```bash
+# from this repo after building:
+cargo build -p tducks --release
+sudo ./scripts/install-tducks.sh --from-file ./target/release/tducks
+# or after a GitHub Release tag v*:
+# curl -fsSL .../scripts/install-tducks.sh | sudo bash
+```
+
+Appliance product draft: [`docs/pond-appliance.md`](./docs/pond-appliance.md).
 
 ## Dev harness
 
@@ -76,6 +95,8 @@ cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
 
 ## Docs
 
+- [Install / Pond DIY](./docs/install.md)
+- [Pond appliance one-pager](./docs/pond-appliance.md)
 - [MVP accept checklist](./docs/mvp-accept.md)
 - [Post-MVP backlog](./docs/post-mvp-backlog.md)
 - [Operator harness](./docs/harness.md)

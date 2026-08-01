@@ -1,0 +1,33 @@
+[Unit]
+Description=Thunderducks Pond node (tducks)
+Documentation=https://github.com/Everwood-Technologies/thunderducks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tducks
+Group=tducks
+# State dir: SQLite + keys (create via install script)
+Environment=TD_DATA_DIR=/var/lib/thunderducks
+Environment=TD_BIND=127.0.0.1:8788
+# Optional overrides: /etc/thunderducks/tducks.env
+EnvironmentFile=-/etc/thunderducks/tducks.env
+ExecStart=/usr/bin/tducks serve --bind ${TD_BIND}
+Restart=on-failure
+RestartSec=2
+# Hardening (safe defaults for localhost RPC)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/thunderducks
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

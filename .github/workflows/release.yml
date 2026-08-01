@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0); empty = run id snapshot"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross linker (aarch64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release tducks
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          if [ "$CROSS" = "true" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build -p tducks --release --target "$TARGET"
+          else
+            cargo build -p tducks --release --target "$TARGET"
+          fi
+          ls -la "target/${TARGET}/release/tducks"
+
+      - name: Package tarball
+        id: pack
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            VER="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="snapshot-${GITHUB_RUN_ID}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          STAGE="tducks-${VER}-${TARGET}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/tducks" "$STAGE/tducks"
+          chmod +x "$STAGE/tducks"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || cp README.md "$STAGE/"
+          cp packaging/systemd/tducks.service "$STAGE/"
+          cp packaging/tducks.env.example "$STAGE/"
+          cp scripts/install-tducks.sh "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          # Also flat-friendly name used by install script finder
+          echo "asset=${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -la "${STAGE}.tar.gz"
+          "target/${TARGET}/release/tducks" --help >/dev/null || true
+          "target/${TARGET}/release/tducks" version || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tducks-${{ matrix.target }}
+          path: tducks-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: find dist -type f -print
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
