@@ -327,6 +327,9 @@ pub struct PeerEndpoint {
     pub p2p: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc: Option<String>,
+    /// Optional remote device id (hex) for relay Olm fanout targeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 struct NodeSession {
@@ -340,6 +343,8 @@ struct NodeSession {
     e2ee: E2eeDevice,
     /// rooms where we own an outbound Megolm session (encrypt path)
     e2ee_rooms: HashMap<String, bool>,
+    /// Cached peer Olm identity keys for per-recipient relay seal (v2).
+    peer_olm_keys: HashMap<td_crypto::DeviceId, OlmDeviceKeys>,
     ts_counter: u64,
     /// local P2P listen URI once started
     p2p_uri: Option<String>,
@@ -393,6 +398,7 @@ impl NodeSession {
             passkeys: PasskeyRegistry::localhost_default(),
             e2ee,
             e2ee_rooms: HashMap::new(),
+            peer_olm_keys: HashMap::new(),
             ts_counter: 1,
             p2p_uri: None,
             rpc_base: None,
@@ -529,11 +535,78 @@ impl NodeSession {
         self.e2ee_rooms.insert(room_hex.to_string(), true);
     }
 
+    /// Remember peer Olm keys for per-recipient relay seal.
+    fn remember_peer_olm(&mut self, keys: OlmDeviceKeys) {
+        self.peer_olm_keys.insert(keys.device_id, keys);
+    }
+
+    /// Ensure outbound Olm to peer using cached keys (no network).
+    fn ensure_olm_to(&mut self, peer: td_crypto::DeviceId) -> Result<(), String> {
+        if self.e2ee.has_olm_session(peer) {
+            return Ok(());
+        }
+        let keys = self
+            .peer_olm_keys
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| format!("no olm keys cached for peer {}", hex::encode(peer.0)))?;
+        self.e2ee
+            .establish_olm_outbound(&keys)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Relay fanout recipients: linked secondaries + peers with known device_id + olm cache.
+    fn relay_recipients(&self) -> Vec<td_crypto::DeviceId> {
+        let mut out = Vec::new();
+        let self_id = self.keypair.device_id();
+        for d in self.link.linked_devices() {
+            if d != self_id {
+                out.push(d);
+            }
+        }
+        for ep in self.peers.values() {
+            if let Some(hex_id) = ep.device_id.as_deref() {
+                if let Ok(id) = parse_crypto_device_id(hex_id) {
+                    if id != self_id && !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        for id in self.peer_olm_keys.keys() {
+            if *id != self_id && !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// Seal one event for one recipient: Olm v2 preferred, AEAD v1 fallback.
+    fn seal_event_for_recipient(
+        &mut self,
+        ev: &SignedEvent,
+        recip: td_crypto::DeviceId,
+    ) -> Result<(Vec<u8>, &'static str), String> {
+        match self.ensure_olm_to(recip) {
+            Ok(()) => {
+                let ct = DeviceNode::seal_for_relay_olm(&mut self.e2ee, recip, ev)
+                    .map_err(|e| e.to_string())?;
+                Ok((ct, "olm-v2"))
+            }
+            Err(_) => {
+                let ct =
+                    DeviceNode::seal_for_relay(ev, &self.relay_key).map_err(|e| e.to_string())?;
+                Ok((ct, "aead-v1"))
+            }
+        }
+    }
+
     fn upsert_peer(&mut self, name: &str, uri: &str, rpc: Option<&str>, p2p: Option<&str>) {
         let mut ep = self.peers.remove(name).unwrap_or(PeerEndpoint {
             name: name.to_string(),
             p2p: None,
             rpc: None,
+            device_id: None,
         });
         let u = uri.trim();
         if u.starts_with("http://") || u.starts_with("https://") {
@@ -743,6 +816,9 @@ pub struct AddPeerRequest {
     pub rpc: Option<String>,
     #[serde(default)]
     pub p2p: Option<String>,
+    /// Optional peer device id (hex) for relay Olm targeting.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1933,6 +2009,11 @@ async fn add_peer(
     }
     let uri = req.uri.clone().unwrap_or_default();
     g.upsert_peer(&req.name, &uri, req.rpc.as_deref(), req.p2p.as_deref());
+    if let Some(did) = req.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(ep) = g.peers.get_mut(&req.name) {
+            ep.device_id = Some(did.to_string());
+        }
+    }
     let ep = g.peers.get(&req.name).cloned();
     Json(serde_json::json!({ "ok": true, "peer": ep })).into_response()
 }
@@ -2376,6 +2457,70 @@ fn parse_crypto_device_id(s: &str) -> Result<td_crypto::DeviceId, String> {
     Ok(td_crypto::DeviceId(a))
 }
 
+
+#[derive(Debug, Deserialize)]
+struct TrustOlmKeysRequest {
+    device_id: String,
+    curve25519_b64: String,
+    one_time_key_b64: String,
+    /// Optional peer name to stamp device_id onto.
+    #[serde(default)]
+    peer_name: Option<String>,
+}
+
+/// Register a peer's Olm identity keys for per-recipient relay seal (v2).
+async fn trust_olm_keys(
+    State(st): State<RpcState>,
+    headers: HeaderMap,
+    Json(req): Json<TrustOlmKeysRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    if let Err(resp) = require_owner_if_remote(&st, &mut g, &headers) {
+        if st.require_owner {
+            return *resp;
+        }
+    }
+    let peer_dev = match parse_crypto_device_id(&req.device_id) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody { error: e }),
+            )
+                .into_response();
+        }
+    };
+    let keys = OlmDeviceKeys {
+        device_id: peer_dev,
+        curve25519_b64: req.curve25519_b64,
+        one_time_key_b64: req.one_time_key_b64,
+    };
+    match g.e2ee.establish_olm_outbound(&keys) {
+        Ok(()) => {
+            g.remember_peer_olm(keys);
+            if let Some(name) = req.peer_name.as_deref() {
+                if let Some(ep) = g.peers.get_mut(name) {
+                    ep.device_id = Some(hex32(&peer_dev.0));
+                }
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "device_id": hex32(&peer_dev.0),
+                "olm_ready": true,
+                "relay_seal": "olm-v2",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn olm_keys_get(State(st): State<RpcState>) -> impl IntoResponse {
     let mut g = st.inner.lock().await;
     match g.e2ee.publish_keys() {
@@ -2530,6 +2675,7 @@ async fn share_megolm_olm_to_peer(
     let (olm_ct, sender_curve, session_id, sender_dev) = {
         let mut g = st.inner.lock().await;
         g.ensure_room_e2ee(room_hex);
+        g.remember_peer_olm(their.clone());
         g.e2ee
             .establish_olm_outbound(&their)
             .map_err(|e| e.to_string())?;
@@ -2618,7 +2764,7 @@ async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
         "require_owner": st.require_owner,
         "rate_limit": st.rate_limit_enabled,
         "p2p_noise": g.p2p_noise,
-        "relay_seal": "chacha20poly1305-v1",
+        "relay_seal": "olm-v2+aead-v1",
         "peers": g.peers.values().collect::<Vec<_>>(),
     }))
     .into_response()
@@ -3347,6 +3493,7 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/sync/ingest", post(sync_ingest))
         .route("/v1/sync/peer", post(sync_peer))
         .route("/v1/e2ee/olm-keys", get(olm_keys_get))
+        .route("/v1/e2ee/trust-keys", post(trust_olm_keys))
         .route("/v1/e2ee/export-session", post(export_session))
         .route("/v1/e2ee/import-session", post(import_session))
         .route("/v1/e2ee/import-olm", post(import_session_olm))
@@ -3465,13 +3612,13 @@ async fn start_p2p_listener(
 }
 
 async fn poll_relay_once(state: &RpcState) -> Result<u32, String> {
-    let (relay_uri, key, device_id) = {
+    let (relay_uri, device_id) = {
         let g = state.inner.lock().await;
         let uri = g
             .relay_uri
             .clone()
             .ok_or_else(|| "no relay configured".to_string())?;
-        (uri, g.relay_key, g.keypair.event_device_id())
+        (uri, g.keypair.event_device_id())
     };
     let peer = PeerUri::parse(&relay_uri).map_err(|e| e.to_string())?;
     let mut client = RelayClient::connect(&peer)
@@ -3484,7 +3631,12 @@ async fn poll_relay_once(state: &RpcState) -> Result<u32, String> {
     let mut acked = Vec::new();
     let mut inserted = 0u32;
     for env in items {
-        match DeviceNode::open_from_relay(&env.ciphertext, &key) {
+        let opened = {
+            let mut g = state.inner.lock().await;
+            let key = g.relay_key;
+            DeviceNode::open_from_relay_auto(&mut g.e2ee, Some(&key), &env.ciphertext)
+        };
+        match opened {
             Ok(ev) => {
                 let room_id = ev.room_id;
                 let ok = {
@@ -3538,25 +3690,17 @@ fn spawn_relay_poller(state: RpcState) {
     });
 }
 
-/// Push sealed local outbox events to the configured relay for each known peer device id
-/// is not available yet; MVP push is explicit via outbox for linked secondary device ids
-/// stored in link registry (best-effort assist).
+/// Push sealed local outbox events to the configured relay.
+/// Prefer per-recipient Olm (v2); fall back to shared AEAD (v1) when no Olm session.
 async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
-    let (relay_uri, key, sender, recipients, events) = {
+    let (relay_uri, sender, sealed) = {
         let mut g = state.inner.lock().await;
         let uri = g
             .relay_uri
             .clone()
             .ok_or_else(|| "no relay configured".to_string())?;
-        let key = g.relay_key;
         let sender = g.keypair.event_device_id();
-        let recipients: Vec<td_event::DeviceId> = g
-            .link
-            .linked_devices()
-            .into_iter()
-            .filter(|d| *d != g.keypair.device_id())
-            .map(|d| d.into())
-            .collect();
+        let recipients = g.relay_recipients();
         // Drain a bounded number from outbox for relay assist.
         let mut events = Vec::new();
         for _ in 0..16 {
@@ -3565,9 +3709,20 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
                 None => break,
             }
         }
-        (uri, key, sender, recipients, events)
+        if events.is_empty() || recipients.is_empty() {
+            return Ok(0);
+        }
+        let mut sealed: Vec<(td_event::DeviceId, Option<td_event::RoomId>, u64, Vec<u8>)> =
+            Vec::new();
+        for ev in &events {
+            for recip in &recipients {
+                let (ct, _mode) = g.seal_event_for_recipient(ev, *recip)?;
+                sealed.push(((*recip).into(), Some(ev.room_id), ev.ts_ms, ct));
+            }
+        }
+        (uri, sender, sealed)
     };
-    if events.is_empty() || recipients.is_empty() {
+    if sealed.is_empty() {
         return Ok(0);
     }
     let peer = PeerUri::parse(&relay_uri).map_err(|e| e.to_string())?;
@@ -3575,19 +3730,10 @@ async fn push_outbox_to_relay(state: &RpcState) -> Result<u32, String> {
         .await
         .map_err(|e| e.to_string())?;
     let mut n = 0u32;
-    for ev in events {
-        let ct = DeviceNode::seal_for_relay(&ev, &key).map_err(|e| e.to_string())?;
-        for recip in &recipients {
-            let env = RelayEnvelope::new(
-                *recip,
-                sender,
-                Some(ev.room_id),
-                ct.clone(),
-                ev.ts_ms,
-            );
-            client.put(env).await.map_err(|e| e.to_string())?;
-            n += 1;
-        }
+    for (recip, room, ts, ct) in sealed {
+        let env = RelayEnvelope::new(recip, sender, room, ct, ts);
+        client.put(env).await.map_err(|e| e.to_string())?;
+        n += 1;
     }
     Ok(n)
 }

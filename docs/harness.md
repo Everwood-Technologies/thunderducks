@@ -53,7 +53,7 @@ New RPC used by the demo:
 ## Notes
 
 - P2P path is length-prefixed framed events on TCP (`td://host:port`). QUIC later.
-- Relay outer layer is opaque ciphertext at rest; production seal is **ChaCha20-Poly1305** (`TD_RELAY_KEY` / `DeviceNode::seal_for_relay`) — relay never sees room plaintext API.
+- Relay outer layer is opaque ciphertext at rest; preferred seal is **Olm per-recipient v2** (`seal_for_relay_olm`); shared AEAD v1 (`TD_RELAY_KEY`) is fallback — relay never sees room plaintext API.
 - Megolm room keys are **Olm-wrapped** on fanout/share (`GET /v1/e2ee/olm-keys`, `POST /v1/e2ee/import-olm`, `POST /v1/e2ee/share-session` path=olm). Plaintext `import-session` remains as a legacy/compat path only.
 - **send-just-works (P0):** `POST /v1/messages` auto-shares the room Megolm session and delta-ingests to every peer with an HTTP `rpc` endpoint (`fanout_ok` / `fanout_peers` in the response). Register peers with `rpc` (not only `td://` P2P) for reliable multi-node decrypt.
 - **shared room Megolm (B2):** one outbound Megolm session per room. Fanout delivers an Olm-wrapped `RoomOutboundPackage` (pickle + inbound session_key). Peers import outbound so **any member can encrypt with the same `session_id`**; first-writer wins if sessions diverge; ratchet only advances (never regresses). Import path: `olm-room-outbound` (legacy inbound-only `olm` still accepted).

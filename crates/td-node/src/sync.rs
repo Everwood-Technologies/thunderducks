@@ -234,14 +234,24 @@ impl DeviceNode {
 
     /// Encode a signed event as opaque relay ciphertext (device-side).
     ///
-    /// Production path: ChaCha20-Poly1305 AEAD (`td_crypto::seal_bytes`) with a
-    /// 32-byte key shared among linked devices (`TD_RELAY_KEY`).
+    /// Prefer [`seal_for_relay_olm`] (per-recipient). This is v1 shared-key AEAD
+    /// fallback when no Olm session exists (`TD_RELAY_KEY`).
     pub fn seal_for_relay(ev: &SignedEvent, key: &[u8; 32]) -> Result<Vec<u8>, SyncError> {
         let raw = serde_json::to_vec(ev)?;
         td_crypto::seal_bytes(key, &raw).map_err(|e| SyncError::RelaySeal(e.to_string()))
     }
 
-    /// Open sealed relay ciphertext and verify the signed event.
+    /// Per-recipient Olm wrap (v2). Requires established outbound Olm to `to`.
+    pub fn seal_for_relay_olm(
+        e2ee: &mut td_crypto::E2eeDevice,
+        to: td_crypto::DeviceId,
+        ev: &SignedEvent,
+    ) -> Result<Vec<u8>, SyncError> {
+        let raw = serde_json::to_vec(ev)?;
+        td_crypto::seal_bytes_olm(e2ee, to, &raw).map_err(|e| SyncError::RelaySeal(e.to_string()))
+    }
+
+    /// Open sealed relay ciphertext (v1 AEAD only) and verify the signed event.
     pub fn open_from_relay(ciphertext: &[u8], key: &[u8; 32]) -> Result<SignedEvent, SyncError> {
         let raw = td_crypto::open_bytes(key, ciphertext)
             .map_err(|e| SyncError::RelaySeal(e.to_string()))?;
@@ -251,15 +261,29 @@ impl DeviceNode {
         Ok(ev)
     }
 
-    /// Legacy XOR-pad seal (tests / migration only). Prefer [`seal_for_relay`].
-    #[deprecated(note = "use seal_for_relay with AEAD key")]
+    /// Open v1 or v2 relay ciphertext. v2 uses Olm; v1 needs `aead_key`.
+    pub fn open_from_relay_auto(
+        e2ee: &mut td_crypto::E2eeDevice,
+        aead_key: Option<&[u8; 32]>,
+        ciphertext: &[u8],
+    ) -> Result<SignedEvent, SyncError> {
+        let raw = td_crypto::open_bytes_auto(e2ee, aead_key, ciphertext)
+            .map_err(|e| SyncError::RelaySeal(e.to_string()))?;
+        let ev: SignedEvent =
+            serde_json::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;
+        verify_event(&ev)?;
+        Ok(ev)
+    }
+
+    /// Legacy XOR-pad seal (tests / migration only). Prefer Olm or AEAD seal.
+    #[deprecated(note = "use seal_for_relay_olm or seal_for_relay")]
     pub fn seal_for_relay_xor(ev: &SignedEvent, pad: u8) -> Result<Vec<u8>, SyncError> {
         let raw = serde_json::to_vec(ev)?;
         Ok(raw.into_iter().map(|b| b ^ pad).collect())
     }
 
     /// Legacy XOR-pad open (tests / migration only).
-    #[deprecated(note = "use open_from_relay with AEAD key")]
+    #[deprecated(note = "use open_from_relay_auto")]
     pub fn open_from_relay_xor(ciphertext: &[u8], pad: u8) -> Result<SignedEvent, SyncError> {
         let raw: Vec<u8> = ciphertext.iter().map(|b| b ^ pad).collect();
         let ev: SignedEvent =

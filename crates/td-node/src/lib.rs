@@ -121,6 +121,24 @@ mod tests {
         // wrong key must fail
         let bad = td_crypto::derive_relay_key(b"wrong");
         assert!(DeviceNode::open_from_relay(&ct, &bad).is_err());
+
+        // Per-recipient Olm (v2) — preferred production path.
+        let bob_kp = DeviceKeypair::generate();
+        let mut alice_e2ee = td_crypto::E2eeDevice::new(kp.device_id());
+        let mut bob_e2ee = td_crypto::E2eeDevice::new(bob_kp.device_id());
+        let bob_keys = bob_e2ee.publish_keys().unwrap();
+        alice_e2ee.establish_olm_outbound(&bob_keys).unwrap();
+        let ct2 = DeviceNode::seal_for_relay_olm(&mut alice_e2ee, bob_kp.device_id(), &ev).unwrap();
+        assert_eq!(ct2[0], td_crypto::RELAY_SEAL_V2_OLM);
+        assert!(!ct2.windows(2).any(|w| w == b"{}"));
+        // Shared AEAD cannot open v2.
+        assert!(DeviceNode::open_from_relay(&ct2, &key).is_err());
+        let opened2 =
+            DeviceNode::open_from_relay_auto(&mut bob_e2ee, Some(&key), &ct2).unwrap();
+        assert_eq!(opened2.id, create.id);
+        // Wrong recipient cannot open.
+        let mut carol = td_crypto::E2eeDevice::new(DeviceKeypair::generate().device_id());
+        assert!(DeviceNode::open_from_relay_auto(&mut carol, Some(&key), &ct2).is_err());
     }
 
     #[test]

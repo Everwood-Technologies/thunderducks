@@ -15,7 +15,7 @@
 |------|-----|----------|--------|
 | **Local only** (default) | DIY install | `127.0.0.1:8788` | Safest; web on same host or SSH tunnel |
 | **Tailnet / LAN** | Tailscale (or similar) + advertise host | often still loopback + reverse proxy, or `0.0.0.0` on tailnet NIC | Set `TD_ADVERTISE_HOST` to tailnet IP/DNS |
-| **Relay assist** | `td-relay` + `TD_RELAY_URI` | unchanged | Opaque envelopes; **ChaCha20-Poly1305** AEAD seal (`TD_RELAY_KEY`) |
+| **Relay assist** | `td-relay` + `TD_RELAY_URI` | unchanged | Opaque envelopes; **Olm per-recipient (v2)** preferred, AEAD v1 fallback (`TD_RELAY_KEY`) |
 
 Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner-session gating turns on for admin mutations.
 
@@ -28,7 +28,7 @@ Do **not** publish `:8788` to the open internet. If you bind non-loopback, owner
 | `TD_P2P_BIND` / `--p2p-bind` | P2P listen (default `127.0.0.1:0`) — use `0.0.0.0:0` for LAN/tailnet peers |
 | `TD_ADVERTISE_HOST` / `--advertise-host` | Host/IP rewritten into `rpc_base` + `p2p_uri` |
 | `TD_RELAY_URI` / `--relay-uri` | Assist relay `td://host:port` or `td-noise://host:port` |
-| `TD_RELAY_KEY` / `--relay-key` | AEAD seal key material (UTF-8 or 64-hex); derived via blake3 domain sep |
+| `TD_RELAY_KEY` / `--relay-key` | Fallback shared AEAD key (v1) when Olm session missing; UTF-8 or 64-hex → blake3 |
 | `TD_P2P_NOISE` / `--p2p-noise` | Advertise `td-noise://` + Noise_XX on P2P accept (default **false**) |
 | `TD_REQUIRE_OWNER` / `--require-owner` | When bind is **non-loopback**, require owner session for **non-public** routes (default **true**) |
 | `TD_RATE_LIMIT` / `--rate-limit` | Per-IP sliding-window rate limits (default **true**) |
@@ -111,7 +111,7 @@ export TD_RELAY_URI=td://relay.example.com:7700
 
 Honest limits:
 
-- Relay never sees room plaintext API; device-side seal is **ChaCha20-Poly1305** with `TD_RELAY_KEY` (shared among linked devices — not per-recipient Olm wrap yet).
+- Relay never sees room plaintext API. Preferred device-side seal is **Olm per-recipient (v2)** after `POST /v1/e2ee/trust-keys` (or share-session which caches keys). Shared-key AEAD (`TD_RELAY_KEY`, v1) is fallback only when no Olm session exists.
 - Noise_XX available for P2P; QUIC still later. HTTP RPC TLS is terminate-at-proxy / tailscale serve.
 - Pair links still embed RPC base; use advertise host + recovery unlock on the client.
 - OTA / Wi‑Fi: see [`ota-wifi.md`](./ota-wifi.md).

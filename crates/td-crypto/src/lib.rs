@@ -12,8 +12,9 @@ pub use e2ee::{
     RoomOutboundPackage, ROOM_PICKLE_KEY,
 };
 pub use relay_seal::{
-    derive_relay_key, open_bytes, parse_relay_key_material, seal_bytes, RelaySealError,
-    DEFAULT_RELAY_KEY_MATERIAL, RELAY_SEAL_V1,
+    derive_relay_key, open_bytes, open_bytes_auto, open_bytes_olm, parse_relay_key_material,
+    seal_bytes, seal_bytes_olm, seal_version, RelayOlmWire, RelaySealError,
+    DEFAULT_RELAY_KEY_MATERIAL, RELAY_SEAL_V1, RELAY_SEAL_V2_OLM,
 };
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
 pub use passkey::{
