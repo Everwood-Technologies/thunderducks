@@ -231,6 +231,59 @@ mod tests {
                 .unwrap();
             assert_eq!(msgs.messages.len(), 1);
             assert_eq!(msgs.messages[0].text, "honk");
+            assert!(!st.claimed);
+
+            let claim: serde_json::Value = client
+                .post(format!("{base}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Test Pond"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(claim["ok"], true);
+            assert_eq!(claim["claimed"], true);
+            assert!(claim["recovery_code"].as_str().unwrap().len() >= 8);
+
+            let st2: StatusResponse = client
+                .get(format!("{base}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(st2.claimed);
+            assert_eq!(st2.display_name.as_deref(), Some("Test Pond"));
+
+            let pair: serde_json::Value = client
+                .post(format!("{base}/v1/pair"))
+                .json(&serde_json::json!({"label": "phone", "ttl_secs": 120}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(pair["ok"], true);
+            let token = pair["token"].as_str().unwrap().to_string();
+            assert_eq!(token.len(), 32);
+
+            let redeem: serde_json::Value = client
+                .post(format!("{base}/v1/pair/redeem"))
+                .json(&serde_json::json!({
+                    "token": token,
+                    "device_label": "Mike Phone"
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(redeem["paired"], true);
+            assert_eq!(redeem["pond_name"], "Test Pond");
         });
     }
 }

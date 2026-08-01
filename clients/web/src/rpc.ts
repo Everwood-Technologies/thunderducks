@@ -10,6 +10,47 @@ export type Status = {
   passkey_credentials?: number;
   e2ee_default?: boolean;
   p2p_uri?: string | null;
+  claimed?: boolean;
+  display_name?: string | null;
+  claimed_at_ms?: number | null;
+  pair_tokens_active?: number;
+};
+
+export type ClaimStatus = {
+  claimed: boolean;
+  display_name?: string | null;
+  claimed_at_ms?: number | null;
+  device_id: string;
+  rpc_base?: string | null;
+  p2p_uri?: string | null;
+};
+
+export type ClaimResponse = {
+  ok: boolean;
+  claimed: boolean;
+  display_name: string;
+  recovery_code: string;
+  device_id: string;
+  claimed_at_ms: number;
+};
+
+export type PairCreateResponse = {
+  ok: boolean;
+  token: string;
+  label: string;
+  expires_in_secs: number;
+  pair_path: string;
+  rpc_base?: string | null;
+};
+
+export type PairRedeemResponse = {
+  ok: boolean;
+  paired: boolean;
+  label: string;
+  pond_name?: string | null;
+  device_id: string;
+  rpc_base?: string | null;
+  p2p_uri?: string | null;
 };
 
 export type CreateRoomResponse = { room_id: string; event_id: string };
@@ -235,10 +276,123 @@ export class TdRpcClient {
     });
     if (!r.ok) throw new Error(`addPeer HTTP ${r.status}`);
   }
+
+  async claimStatus(): Promise<ClaimStatus> {
+    const r = await fetch(this.url("/v1/claim"));
+    if (!r.ok) throw new Error(`claim status HTTP ${r.status}`);
+    return (await r.json()) as ClaimStatus;
+  }
+
+  async claim(displayName: string, recoveryCode?: string): Promise<ClaimResponse> {
+    const body: Record<string, string> = { display_name: displayName };
+    if (recoveryCode && recoveryCode.trim()) body.recovery_code = recoveryCode.trim();
+    const r = await fetch(this.url("/v1/claim"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`claim HTTP ${r.status}: ${err}`);
+    }
+    return (await r.json()) as ClaimResponse;
+  }
+
+  async pairCreate(label = "device", ttlSecs = 600): Promise<PairCreateResponse> {
+    const r = await fetch(this.url("/v1/pair"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label, ttl_secs: ttlSecs }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`pair create HTTP ${r.status}: ${err}`);
+    }
+    return (await r.json()) as PairCreateResponse;
+  }
+
+  async pairRedeem(token: string, deviceLabel?: string): Promise<PairRedeemResponse> {
+    const r = await fetch(this.url("/v1/pair/redeem"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, device_label: deviceLabel }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`pair redeem HTTP ${r.status}: ${err}`);
+    }
+    return (await r.json()) as PairRedeemResponse;
+  }
+
+  async pairList(): Promise<{ claimed: boolean; tokens: unknown[] }> {
+    const r = await fetch(this.url("/v1/pair"));
+    if (!r.ok) throw new Error(`pair list HTTP ${r.status}`);
+    return (await r.json()) as { claimed: boolean; tokens: unknown[] };
+  }
 }
 
-/** In-browser UI bootstrap when loaded as a page script. */
-export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
+function mountClaimWizard(root: HTMLElement, client: TdRpcClient): void {
+  root.innerHTML = `
+    <h1>Thunderducks Pond</h1>
+    <p style="color:#444">First-run setup — claim this node. Save the recovery code offline.</p>
+    <p style="font-size:0.9rem">RPC <code>${client.baseUrl}</code></p>
+    <label>Pond name<br/><input id="name" value="Home Pond" style="min-width:16rem" /></label>
+    <div style="margin-top:0.75rem">
+      <button id="claim">Claim Pond</button>
+    </div>
+    <pre id="out" style="margin-top:1rem"></pre>
+  `;
+  const out = root.querySelector("#out") as HTMLPreElement;
+  root.querySelector("#claim")!.addEventListener("click", () => {
+    const name = (root.querySelector("#name") as HTMLInputElement).value.trim() || "Home Pond";
+    void (async () => {
+      try {
+        const res = await client.claim(name);
+        out.textContent =
+          `Claimed "${res.display_name}"\n\nRECOVERY CODE (save now — shown once):\n${res.recovery_code}\n\ndevice ${res.device_id.slice(0, 16)}…`;
+        const btn = document.createElement("button");
+        btn.textContent = "Continue to chat";
+        btn.style.marginTop = "0.75rem";
+        btn.onclick = () => mountChatUi(root, client);
+        root.appendChild(btn);
+      } catch (e) {
+        out.textContent = `claim failed: ${(e as Error).message}`;
+      }
+    })();
+  });
+}
+
+function mountPairRedeem(root: HTMLElement, client: TdRpcClient, token: string): void {
+  root.innerHTML = `
+    <h1>Pair with Pond</h1>
+    <p>Redeeming invite on <code>${client.baseUrl}</code></p>
+    <label>Device label<br/><input id="label" value="Phone" style="min-width:12rem" /></label>
+    <div style="margin-top:0.75rem">
+      <button id="go">Pair</button>
+    </div>
+    <pre id="out" style="margin-top:1rem"></pre>
+  `;
+  const out = root.querySelector("#out") as HTMLPreElement;
+  root.querySelector("#go")!.addEventListener("click", () => {
+    const label = (root.querySelector("#label") as HTMLInputElement).value.trim() || "Phone";
+    void (async () => {
+      try {
+        const res = await client.pairRedeem(token, label);
+        out.textContent = `Paired with "${res.pond_name ?? "Pond"}" as ${res.label}\nnode ${res.device_id.slice(0, 16)}…\np2p ${res.p2p_uri ?? "—"}`;
+        const btn = document.createElement("button");
+        btn.textContent = "Open chat";
+        btn.style.marginTop = "0.75rem";
+        btn.onclick = () => mountChatUi(root, client);
+        root.appendChild(btn);
+      } catch (e) {
+        out.textContent = `pair failed: ${(e as Error).message}`;
+      }
+    })();
+  });
+}
+
+/** Chat UI (post-claim). */
+export function mountChatUi(root: HTMLElement, client: TdRpcClient): void {
   const params = new URLSearchParams(location.search);
   const presetRoom = params.get("room");
   const nodeName = params.get("name") || "node";
@@ -254,6 +408,7 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
     </p>
     <div>
       <button id="link">Link secondary</button>
+      <button id="pair">Pair device</button>
       <button id="room">Create room</button>
       <button id="sync">Sync peers (manual)</button>
       <button id="refresh">Refresh msgs</button>
@@ -446,14 +601,32 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
   };
 
   void client.status().then((st) => {
+    const pond = st.display_name ? ` · ${st.display_name}` : "";
     (root.querySelector("#status") as HTMLElement).textContent =
-      `device ${st.device_id.slice(0, 12)}… events=${st.event_count} e2ee=${st.e2ee_default ?? false} p2p=${st.p2p_uri ?? "—"}`;
+      `device ${st.device_id.slice(0, 12)}…${pond} events=${st.event_count} e2ee=${st.e2ee_default ?? false} claimed=${st.claimed ?? false} p2p=${st.p2p_uri ?? "—"}`;
   });
 
   root.querySelector("#link")!.addEventListener("click", () => {
     void client
       .linkSecondary()
       .then((r) => log(`linked secondary ${r.secondary_device.slice(0, 12)}…`));
+  });
+  root.querySelector("#pair")!.addEventListener("click", () => {
+    void (async () => {
+      try {
+        const p = await client.pairCreate(nodeName || "device", 600);
+        const link = `${location.origin}${location.pathname}?rpc=${encodeURIComponent(client.baseUrl)}&pair=${p.token}`;
+        log(`pair token (10m): ${p.token}\nopen on other device:\n${link}`);
+        try {
+          await navigator.clipboard.writeText(link);
+          log("pair link copied to clipboard");
+        } catch {
+          /* ignore */
+        }
+      } catch (e) {
+        log(`pair fail: ${(e as Error).message}`);
+      }
+    })();
   });
   root.querySelector("#room")!.addEventListener("click", () => {
     void client.createRoom(`web-${nodeName}`).then((r) => {
@@ -520,4 +693,32 @@ export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
 
   setLiveLabel();
   if (liveEnabled && roomInput.value.trim()) startLive();
+}
+
+/** In-browser UI bootstrap when loaded as a page script. */
+export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
+  const params = new URLSearchParams(location.search);
+  const pair = params.get("pair");
+  if (pair) {
+    mountPairRedeem(root, client, pair);
+    return;
+  }
+  root.innerHTML = `<p>loading Pond…</p>`;
+  void (async () => {
+    try {
+      const st = await client.claimStatus();
+      if (!st.claimed) {
+        mountClaimWizard(root, client);
+      } else {
+        mountChatUi(root, client);
+      }
+    } catch (e) {
+      root.innerHTML = "";
+      const note = document.createElement("p");
+      note.style.color = "#a00";
+      note.textContent = `claim status unavailable: ${(e as Error).message}`;
+      root.appendChild(note);
+      mountChatUi(root, client);
+    }
+  })();
 }

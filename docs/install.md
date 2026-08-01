@@ -107,7 +107,23 @@ sudo systemctl daemon-reload
 
 Retail/image path uses this same binary + unit. See [`pond-appliance.md`](./pond-appliance.md).
 
-**Not in this slice:** first-run claim UI, OTA, Wi‑Fi wizard, tailnet/relay UX (later Pond phases).
+## First-run claim + pairing (web)
+
+With a node running and the web client pointed at it (`?rpc=`):
+
+1. Unclaimed node → **Claim Pond** wizard (name + one-time recovery code).
+2. Claimed node → chat UI; **Pair device** mints a 10-minute token/link (`?pair=`).
+3. Other device opens the pair link → redeem → continue to chat.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET/POST | `/v1/claim` | Status / claim owner |
+| GET/POST | `/v1/pair` | List / mint pair token |
+| POST | `/v1/pair/redeem` | Redeem pair token |
+
+Recovery code is shown **once** at claim; only a hash is stored on the node.
+
+**Still later Pond phases:** OTA, Wi‑Fi wizard, tailnet/relay UX.
 
 ## Security notes
 

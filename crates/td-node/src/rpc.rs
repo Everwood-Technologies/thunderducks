@@ -13,7 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use rand::RngCore;
 use td_crypto::{
     DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
     PasskeyRegistry, RoomOutboundPackage,
@@ -97,6 +98,10 @@ struct NodeSession {
     p2p_uri: Option<String>,
     /// local HTTP RPC base once serving
     rpc_base: Option<String>,
+    /// Pond first-run claim (owner display name + recovery code hash).
+    claim: ClaimState,
+    /// Active short-lived pairing invites (token -> meta).
+    pair_tokens: HashMap<String, PairToken>,
 }
 
 impl NodeSession {
@@ -118,7 +123,14 @@ impl NodeSession {
             ts_counter: 1,
             p2p_uri: None,
             rpc_base: None,
+            claim: ClaimState::default(),
+            pair_tokens: HashMap::new(),
         }
+    }
+
+    fn purge_expired_pair_tokens(&mut self) {
+        let now = Instant::now();
+        self.pair_tokens.retain(|_, t| t.expires_at > now);
     }
 
     fn next_ts(&mut self) -> u64 {
@@ -203,6 +215,12 @@ pub struct StatusResponse {
     pub passkey_credentials: usize,
     pub e2ee_default: bool,
     pub p2p_uri: Option<String>,
+    pub claimed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at_ms: Option<u64>,
+    pub pair_tokens_active: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,6 +232,54 @@ pub struct PeerInfo {
     pub rpc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p: Option<String>,
+}
+
+/// Owner claim state for first-run Pond setup.
+#[derive(Debug, Clone, Default)]
+struct ClaimState {
+    claimed: bool,
+    display_name: Option<String>,
+    /// blake3 hex of recovery code (never store plaintext).
+    #[allow(dead_code)] // reserved for future recovery-login path
+    recovery_hash: Option<String>,
+    claimed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PairToken {
+    label: String,
+    expires_at: Instant,
+    created_ms: u64,
+    redeemed_by: Option<String>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn random_token_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+fn recovery_code_new() -> String {
+    let raw = random_token_hex(10);
+    format!(
+        "{}-{}-{}-{}",
+        &raw[0..5],
+        &raw[5..10],
+        &raw[10..15],
+        &raw[15..20]
+    )
+}
+
+fn hash_recovery(code: &str) -> String {
+    let norm = code.trim().to_uppercase().replace([' ', '_'], "");
+    hex::encode(blake3::hash(norm.as_bytes()).as_bytes())
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,7 +435,7 @@ fn decrypt_message_text(e2ee: &mut E2eeDevice, ev: &SignedEvent) -> String {
 }
 
 async fn status(State(st): State<RpcState>) -> impl IntoResponse {
-    let g = st.inner.lock().await;
+    let mut g = st.inner.lock().await;
     let rooms = g.node.room_ids().into_iter().map(|r| hex32(&r.0)).collect();
     let linked = g
         .link
@@ -394,6 +460,7 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
             }
         })
         .collect();
+    g.purge_expired_pair_tokens();
     Json(StatusResponse {
         device_id: hex32(&g.keypair.device_id().0),
         verifying_key: hex::encode(g.keypair.verifying_key().as_bytes()),
@@ -404,7 +471,307 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         passkey_credentials: g.passkeys.credential_count(),
         e2ee_default: true,
         p2p_uri: g.p2p_uri.clone(),
+        claimed: g.claim.claimed,
+        display_name: g.claim.display_name.clone(),
+        claimed_at_ms: g.claim.claimed_at_ms,
+        pair_tokens_active: g
+            .pair_tokens
+            .values()
+            .filter(|t| t.redeemed_by.is_none())
+            .count(),
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimRequest {
+    display_name: String,
+    #[serde(default)]
+    recovery_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimResponse {
+    ok: bool,
+    claimed: bool,
+    display_name: String,
+    recovery_code: String,
+    device_id: String,
+    claimed_at_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimStatusResponse {
+    claimed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_at_ms: Option<u64>,
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rpc_base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p2p_uri: Option<String>,
+}
+
+async fn claim_status(State(st): State<RpcState>) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    Json(ClaimStatusResponse {
+        claimed: g.claim.claimed,
+        display_name: g.claim.display_name.clone(),
+        claimed_at_ms: g.claim.claimed_at_ms,
+        device_id: hex32(&g.keypair.device_id().0),
+        rpc_base: g.rpc_base.clone(),
+        p2p_uri: g.p2p_uri.clone(),
+    })
+}
+
+async fn claim_node(
+    State(st): State<RpcState>,
+    Json(req): Json<ClaimRequest>,
+) -> impl IntoResponse {
+    let name = req.display_name.trim().to_string();
+    if name.is_empty() || name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "display_name required (1-64 chars)".into(),
+            }),
+        )
+            .into_response();
+    }
+    let mut g = st.inner.lock().await;
+    if g.claim.claimed {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "node already claimed".into(),
+            }),
+        )
+            .into_response();
+    }
+    let code = req
+        .recovery_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(recovery_code_new);
+    if code.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "recovery_code too short".into(),
+            }),
+        )
+            .into_response();
+    }
+    let at = now_ms();
+    g.claim = ClaimState {
+        claimed: true,
+        display_name: Some(name.clone()),
+        recovery_hash: Some(hash_recovery(&code)),
+        claimed_at_ms: Some(at),
+    };
+    Json(ClaimResponse {
+        ok: true,
+        claimed: true,
+        display_name: name,
+        recovery_code: code,
+        device_id: hex32(&g.keypair.device_id().0),
+        claimed_at_ms: at,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PairCreateRequest {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PairCreateResponse {
+    ok: bool,
+    token: String,
+    label: String,
+    expires_in_secs: u64,
+    pair_path: String,
+    rpc_base: Option<String>,
+}
+
+async fn pair_create(
+    State(st): State<RpcState>,
+    Json(req): Json<PairCreateRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    if !g.claim.claimed {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "claim node before minting pair tokens".into(),
+            }),
+        )
+            .into_response();
+    }
+    g.purge_expired_pair_tokens();
+    let ttl = req.ttl_secs.unwrap_or(600).clamp(60, 3600);
+    let label = req
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("device")
+        .chars()
+        .take(32)
+        .collect::<String>();
+    let token = random_token_hex(16);
+    g.pair_tokens.insert(
+        token.clone(),
+        PairToken {
+            label: label.clone(),
+            expires_at: Instant::now() + Duration::from_secs(ttl),
+            created_ms: now_ms(),
+            redeemed_by: None,
+        },
+    );
+    let rpc_base = g.rpc_base.clone();
+    Json(PairCreateResponse {
+        ok: true,
+        token: token.clone(),
+        label,
+        expires_in_secs: ttl,
+        pair_path: format!("?pair={token}"),
+        rpc_base,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PairRedeemRequest {
+    token: String,
+    #[serde(default)]
+    device_label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PairRedeemResponse {
+    ok: bool,
+    paired: bool,
+    label: String,
+    pond_name: Option<String>,
+    device_id: String,
+    rpc_base: Option<String>,
+    p2p_uri: Option<String>,
+}
+
+async fn pair_redeem(
+    State(st): State<RpcState>,
+    Json(req): Json<PairRedeemRequest>,
+) -> impl IntoResponse {
+    let token = req.token.trim().to_string();
+    if token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "token required".into(),
+            }),
+        )
+            .into_response();
+    }
+    let mut g = st.inner.lock().await;
+    if !g.claim.claimed {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "node not claimed".into(),
+            }),
+        )
+            .into_response();
+    }
+    g.purge_expired_pair_tokens();
+    let expired_or_missing = match g.pair_tokens.get(&token) {
+        None => true,
+        Some(entry) => entry.expires_at <= Instant::now(),
+    };
+    if expired_or_missing {
+        g.pair_tokens.remove(&token);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "invalid or expired pair token".into(),
+            }),
+        )
+            .into_response();
+    }
+    if g.pair_tokens
+        .get(&token)
+        .map(|e| e.redeemed_by.is_some())
+        .unwrap_or(true)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "pair token already used".into(),
+            }),
+        )
+            .into_response();
+    }
+    let default_label = g
+        .pair_tokens
+        .get(&token)
+        .map(|e| e.label.clone())
+        .unwrap_or_else(|| "device".into());
+    let label = req
+        .device_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(32).collect::<String>())
+        .unwrap_or(default_label);
+    let secondary = DeviceKeypair::generate();
+    let secondary_hex = hex32(&secondary.device_id().0);
+    let _ = g.link.trust_local(&secondary);
+    if let Some(entry) = g.pair_tokens.get_mut(&token) {
+        entry.redeemed_by = Some(secondary_hex);
+        entry.label = label.clone();
+    }
+    Json(PairRedeemResponse {
+        ok: true,
+        paired: true,
+        label,
+        pond_name: g.claim.display_name.clone(),
+        device_id: hex32(&g.keypair.device_id().0),
+        rpc_base: g.rpc_base.clone(),
+        p2p_uri: g.p2p_uri.clone(),
+    })
+    .into_response()
+}
+
+async fn pair_list(State(st): State<RpcState>) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    g.purge_expired_pair_tokens();
+    let now = Instant::now();
+    let items: Vec<serde_json::Value> = g
+        .pair_tokens
+        .iter()
+        .map(|(tok, meta)| {
+            let secs = meta.expires_at.saturating_duration_since(now).as_secs();
+            serde_json::json!({
+                "token_prefix": tok.chars().take(8).collect::<String>(),
+                "label": meta.label,
+                "expires_in_secs": secs,
+                "redeemed": meta.redeemed_by.is_some(),
+                "created_ms": meta.created_ms,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "claimed": g.claim.claimed,
+        "tokens": items,
+    }))
+    .into_response()
 }
 
 async fn create_room(
@@ -1520,6 +1887,9 @@ pub fn router(state: RpcState) -> Router {
             get(|| async { Json(serde_json::json!({"ok": true})) }),
         )
         .route("/v1/status", get(status))
+        .route("/v1/claim", get(claim_status).post(claim_node))
+        .route("/v1/pair", get(pair_list).post(pair_create))
+        .route("/v1/pair/redeem", post(pair_redeem))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/link-secondary", post(link_secondary))
         .route("/v1/passkeys/register/begin", post(passkey_register_begin))

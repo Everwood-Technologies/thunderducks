@@ -64,6 +64,24 @@ test("web client enroll -> room -> send/recv against local rpc", async () => {
 
     const st = await client.status();
     assert.equal(st.device_id.length, 64);
+    assert.equal(st.claimed, false);
+
+    const claimSt = await client.claimStatus();
+    assert.equal(claimSt.claimed, false);
+
+    const claimed = await client.claim("Smoke Pond");
+    assert.equal(claimed.ok, true);
+    assert.ok(claimed.recovery_code.length >= 8);
+
+    const st2 = await client.status();
+    assert.equal(st2.claimed, true);
+    assert.equal(st2.display_name, "Smoke Pond");
+
+    const pair = await client.pairCreate("smoke-phone", 120);
+    assert.equal(pair.token.length, 32);
+    const redeemed = await client.pairRedeem(pair.token, "Smoke Phone");
+    assert.equal(redeemed.paired, true);
+    assert.equal(redeemed.pond_name, "Smoke Pond");
 
     const linked = await client.linkSecondary();
     assert.equal(linked.linked, true);
