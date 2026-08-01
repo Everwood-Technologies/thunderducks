@@ -9,7 +9,7 @@ Proxmox host
   └─ CT/VM pond-alpha (Ubuntu 24.04)
        ├─ tducks.service     → 127.0.0.1:8788  (not LAN-exposed)
        ├─ nginx :80          → /var/www/pond + proxy /v1 + /health
-       └─ /var/lib/thunderducks  (claim, identity, OTA state)
+       └─ /var/lib/thunderducks  (claim, identity, events.sqlite, e2ee.json, OTA state)
 ```
 
 Browser opens **`http://<guest-ip>/`** — same-origin API (no `?rpc=` needed).
@@ -40,10 +40,12 @@ sudo /tmp/proxmox-pond-create.sh \
   --bridge vmbr0 \
   --storage local-lvm \
   --template-storage local \
-  --version v0.1.0-alpha.1
+  --version v0.1.0-alpha.2
 ```
 
 Then open the printed `http://<ip>/` URL → **claim** → save recovery code offline → **snapshot**.
+
+> **Pin `v0.1.0-alpha.2+`** for rooms/messages that survive reboot. `alpha.1` only persisted claim/identity.
 
 ### Useful flags
 

@@ -44,6 +44,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.2c | **Pond packaging** (linux amd64/arm64 release + systemd DIY install) | ✅ done (C) |
 | P3.2d | **First-run claim + pairing UI** | ✅ done |
 | P3.2e | **Durable claim + identity** (`TD_DATA_DIR`) | ✅ done |
+| P3.2e2 | **Durable rooms/messages + E2EE** (`events.sqlite` + `e2ee.json`) | ✅ done |
 | P3.2f | **Recovery login + owner session** | ✅ done |
 | P3.2g | **Remote access slice** (advertise host, P2P bind, relay poll/push, owner gate off-loopback) | ✅ done |
 | P3.3 | Encrypted history catch-up packaging polish | open |

@@ -46,6 +46,9 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
         conn.execute_batch(
             r#"
@@ -74,6 +77,33 @@ impl SqliteStore {
             "#,
         )?;
         Ok(Self { conn })
+    }
+
+    /// All events in parent-count / ts order (best-effort causal load order).
+    pub fn list_all(&self) -> Result<Vec<SignedEvent>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT body FROM events")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let body = r?;
+            let ev: SignedEvent = serde_json::from_str(&body).map_err(EventError::from)?;
+            verify_event(&ev)?;
+            out.push(ev);
+        }
+        out.sort_by(|a, b| {
+            a.parents
+                .len()
+                .cmp(&b.parents.len())
+                .then(a.ts_ms.cmp(&b.ts_ms))
+        });
+        Ok(out)
+    }
+
+    pub fn count(&self) -> Result<usize, StoreError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        Ok(n as usize)
     }
 }
 

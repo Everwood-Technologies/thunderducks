@@ -460,29 +460,50 @@ struct NodeSession {
 
 impl NodeSession {
     fn new() -> Self {
-        Self::from_parts(DeviceKeypair::generate(), ClaimState::default(), None)
+        let keypair = DeviceKeypair::generate();
+        let node = DeviceNode::from_crypto_device(keypair.device_id());
+        let e2ee = E2eeDevice::new(keypair.device_id());
+        Self::from_parts(
+            keypair,
+            ClaimState::default(),
+            None,
+            node,
+            e2ee,
+            RoomRegistry::new(),
+            1,
+        )
     }
 
     fn from_parts(
         keypair: DeviceKeypair,
         claim: ClaimState,
         data_dir: Option<NodeDataDir>,
+        node: DeviceNode,
+        e2ee: E2eeDevice,
+        rooms: RoomRegistry,
+        ts_counter: u64,
     ) -> Self {
         let mut link = LinkRegistry::new(keypair.device_id());
         let _ = link.trust_local(&keypair);
-        let node = DeviceNode::from_crypto_device(keypair.device_id());
-        let e2ee = E2eeDevice::new(keypair.device_id());
+        // Mark rooms that already have outbound Megolm as e2ee-ready.
+        let mut e2ee_rooms = HashMap::new();
+        for rid in node.room_ids() {
+            let hex = hex32(&rid.0);
+            if e2ee.has_outbound(&hex) {
+                e2ee_rooms.insert(hex, true);
+            }
+        }
         Self {
             keypair,
             node,
-            rooms: RoomRegistry::new(),
+            rooms,
             peers: HashMap::new(),
             link,
             passkeys: PasskeyRegistry::localhost_default(),
             e2ee,
-            e2ee_rooms: HashMap::new(),
+            e2ee_rooms,
             peer_olm_keys: HashMap::new(),
-            ts_counter: 1,
+            ts_counter: ts_counter.max(1),
             p2p_uri: None,
             rpc_base: None,
             claim,
@@ -523,13 +544,61 @@ impl NodeSession {
             .load_or_create_identity()
             .map_err(|e| format!("identity: {e}"))?;
         let claim = dir.load_claim().map_err(|e| format!("claim: {e}"))?;
-        Ok(Self::from_parts(keypair, claim, Some(dir)))
+        let meta = dir.load_meta().map_err(|e| format!("meta: {e}"))?;
+        let node = DeviceNode::with_sqlite(keypair.device_id(), dir.events_db_path())
+            .map_err(|e| format!("events: {e}"))?;
+        let e2ee = dir
+            .load_e2ee(keypair.device_id())
+            .map_err(|e| format!("e2ee: {e}"))?;
+        // Rebuild room registry from durable DAG (create/membership events).
+        let mut rooms = RoomRegistry::new();
+        for rid in node.room_ids() {
+            for ev in node.list_events(&rid) {
+                let _ = rooms.apply_event(ev);
+            }
+        }
+        // ts_counter must stay ahead of any loaded event timestamps.
+        let mut ts_counter = meta.ts_counter.max(1);
+        for rid in node.room_ids() {
+            for ev in node.list_events(&rid) {
+                if ev.ts_ms >= ts_counter {
+                    ts_counter = ev.ts_ms + 1;
+                }
+            }
+        }
+        Ok(Self::from_parts(
+            keypair,
+            claim,
+            Some(dir),
+            node,
+            e2ee,
+            rooms,
+            ts_counter,
+        ))
     }
 
     fn persist_claim(&self) -> Result<(), String> {
         if let Some(dir) = &self.data_dir {
             dir.save_claim(&self.claim)
                 .map_err(|e| format!("persist claim: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn persist_meta(&self) -> Result<(), String> {
+        if let Some(dir) = &self.data_dir {
+            dir.save_meta(&crate::persist::NodeMetaDisk {
+                ts_counter: self.ts_counter,
+            })
+            .map_err(|e| format!("persist meta: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn persist_e2ee(&self) -> Result<(), String> {
+        if let Some(dir) = &self.data_dir {
+            dir.save_e2ee(&self.e2ee)
+                .map_err(|e| format!("persist e2ee: {e}"))?;
         }
         Ok(())
     }
@@ -606,7 +675,9 @@ impl NodeSession {
 
     fn next_ts(&mut self) -> u64 {
         self.ts_counter += 1;
-        self.ts_counter
+        let ts = self.ts_counter;
+        let _ = self.persist_meta();
+        ts
     }
 
     /// Ensure we can encrypt for this room.
@@ -622,6 +693,7 @@ impl NodeSession {
         }
         let _ = self.e2ee.create_group_session(room_hex);
         self.e2ee_rooms.insert(room_hex.to_string(), true);
+        let _ = self.persist_e2ee();
     }
 
     /// Remember peer Olm keys for per-recipient relay seal.
@@ -1751,6 +1823,8 @@ async fn send_message(
                 .into_response();
         }
     };
+    // Ratchet advanced — persist so reboot can still decrypt.
+    let _ = g.persist_e2ee();
     let payload = serde_json::to_vec(&serde_json::json!({
         "v": 1,
         "enc": "megolm",

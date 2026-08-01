@@ -6,12 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+use vodozemac::megolm::InboundGroupSessionPickle;
 use vodozemac::megolm::{
     GroupSession, GroupSessionPickle, InboundGroupSession, MegolmMessage,
     SessionConfig as MegolmConfig, SessionKey,
 };
 use vodozemac::olm::{
-    Account, InboundCreationResult, OlmMessage, Session as OlmSession, SessionConfig as OlmConfig,
+    Account, AccountPickle, InboundCreationResult, OlmMessage, Session as OlmSession,
+    SessionConfig as OlmConfig, SessionPickle,
 };
 use vodozemac::Curve25519PublicKey;
 
@@ -352,6 +354,142 @@ impl E2eeDevice {
     pub fn curve25519_b64(&self) -> String {
         self.account.curve25519_key().to_base64()
     }
+
+    /// Export full E2EE state for durable disk (encrypted pickles).
+    pub fn export_durable(&self) -> Result<E2eeDurablePackage, E2eeError> {
+        let key = &ROOM_PICKLE_KEY;
+        let account_b64 = self.account.pickle().encrypt(key);
+        let mut olm = Vec::new();
+        for (peer, sess) in &self.olm_sessions {
+            olm.push(OlmSessionDurable {
+                peer_device: hex::encode(peer.0),
+                pickle_b64: sess.pickle().encrypt(key),
+            });
+        }
+        let mut outbound = Vec::new();
+        for (room, sess) in &self.outbound_megolm {
+            outbound.push(MegolmOutboundDurable {
+                room_id: room.clone(),
+                session_id: sess.session_id(),
+                pickle_b64: sess.pickle().encrypt(key),
+            });
+        }
+        let mut inbound = Vec::new();
+        for (sid, sess) in &self.inbound_megolm {
+            inbound.push(MegolmInboundDurable {
+                session_id: sid.clone(),
+                pickle_b64: sess.pickle().encrypt(key),
+            });
+        }
+        Ok(E2eeDurablePackage {
+            v: 1,
+            device_id: hex::encode(self.device_id.0),
+            account_b64,
+            olm,
+            outbound,
+            inbound,
+        })
+    }
+
+    /// Restore E2EE state from durable package (device_id must match).
+    pub fn import_durable(
+        device_id: DeviceId,
+        pkg: &E2eeDurablePackage,
+    ) -> Result<Self, E2eeError> {
+        if pkg.v != 1 {
+            return Err(E2eeError::Codec(format!(
+                "unsupported e2ee durable v={}",
+                pkg.v
+            )));
+        }
+        let want = hex::encode(device_id.0);
+        if pkg.device_id != want {
+            return Err(E2eeError::Codec("e2ee durable device_id mismatch".into()));
+        }
+        let key = &ROOM_PICKLE_KEY;
+        let account = Account::from_pickle(
+            AccountPickle::from_encrypted(&pkg.account_b64, key)
+                .map_err(|e| E2eeError::Pickle(e.to_string()))?,
+        );
+        let mut olm_sessions = HashMap::new();
+        for o in &pkg.olm {
+            let peer = parse_device_hex(&o.peer_device)?;
+            let sess = OlmSession::from_pickle(
+                SessionPickle::from_encrypted(&o.pickle_b64, key)
+                    .map_err(|e| E2eeError::Pickle(e.to_string()))?,
+            );
+            olm_sessions.insert(peer, sess);
+        }
+        let mut outbound_megolm = HashMap::new();
+        for o in &pkg.outbound {
+            let sess = GroupSession::from_pickle(
+                GroupSessionPickle::from_encrypted(&o.pickle_b64, key)
+                    .map_err(|e| E2eeError::Pickle(e.to_string()))?,
+            );
+            outbound_megolm.insert(o.room_id.clone(), sess);
+        }
+        let mut inbound_megolm = HashMap::new();
+        for i in &pkg.inbound {
+            let sess = InboundGroupSession::from_pickle(
+                InboundGroupSessionPickle::from_encrypted(&i.pickle_b64, key)
+                    .map_err(|e| E2eeError::Pickle(e.to_string()))?,
+            );
+            inbound_megolm.insert(i.session_id.clone(), sess);
+        }
+        Ok(Self {
+            device_id,
+            account,
+            olm_sessions,
+            outbound_megolm,
+            inbound_megolm,
+        })
+    }
+}
+
+/// On-disk E2EE package (vodozemac pickles encrypted with [`ROOM_PICKLE_KEY`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2eeDurablePackage {
+    pub v: u32,
+    pub device_id: String,
+    pub account_b64: String,
+    #[serde(default)]
+    pub olm: Vec<OlmSessionDurable>,
+    #[serde(default)]
+    pub outbound: Vec<MegolmOutboundDurable>,
+    #[serde(default)]
+    pub inbound: Vec<MegolmInboundDurable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OlmSessionDurable {
+    pub peer_device: String,
+    pub pickle_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MegolmOutboundDurable {
+    pub room_id: String,
+    pub session_id: String,
+    pub pickle_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MegolmInboundDurable {
+    pub session_id: String,
+    pub pickle_b64: String,
+}
+
+fn parse_device_hex(s: &str) -> Result<DeviceId, E2eeError> {
+    let bytes = hex::decode(s).map_err(|e| E2eeError::Codec(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(E2eeError::Codec(format!(
+            "device id want 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&bytes);
+    Ok(DeviceId(a))
 }
 
 /// Fan out a Megolm session key to many devices over established Olm sessions.

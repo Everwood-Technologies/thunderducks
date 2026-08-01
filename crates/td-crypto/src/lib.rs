@@ -8,7 +8,8 @@ mod relay_seal;
 
 pub use device::{DeviceBundle, DeviceId, DeviceKeypair};
 pub use e2ee::{
-    fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
+    fanout_megolm_key, E2eeDevice, E2eeDurablePackage, E2eeError, MegolmCiphertext,
+    MegolmInboundDurable, MegolmOutboundDurable, OlmCiphertext, OlmDeviceKeys, OlmSessionDurable,
     RoomOutboundPackage, ROOM_PICKLE_KEY,
 };
 pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
@@ -157,6 +158,23 @@ mod tests {
     }
 
     /// B2: one shared room outbound — Bob encrypts with Alice's session after pickle import.
+    #[test]
+    fn e2ee_durable_pickle_roundtrip() {
+        let kp = DeviceKeypair::generate();
+        let mut dev = E2eeDevice::new(kp.device_id());
+        let room = "room-hex-deadbeef";
+        let _ = dev.create_group_session(room);
+        let ct = dev.megolm_encrypt(room, b"persist-me").unwrap();
+        let pkg = dev.export_durable().unwrap();
+        let mut restored = E2eeDevice::import_durable(kp.device_id(), &pkg).unwrap();
+        let plain = restored.megolm_decrypt(&ct).unwrap();
+        assert_eq!(plain, b"persist-me");
+        // ratchet still works after restore
+        let ct2 = restored.megolm_encrypt(room, b"again").unwrap();
+        let plain2 = restored.megolm_decrypt(&ct2).unwrap();
+        assert_eq!(plain2, b"again");
+    }
+
     #[test]
     fn megolm_shared_room_outbound_b2() {
         let a = DeviceKeypair::generate();

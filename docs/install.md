@@ -137,7 +137,7 @@ Recovery code is shown **once** at claim; only a hash is stored on the node.
 4. Restart wipes sessions → unlock again with the recovery code (`?unlock=1` forces the UI).
 5. Failed logins: 5 strikes → 60s lockout (in-memory).
 
-### Durable claim + identity
+### Durable data dir
 
 With `TD_DATA_DIR` / `--data-dir` (systemd default: `/var/lib/thunderducks`):
 
@@ -145,15 +145,20 @@ With `TD_DATA_DIR` / `--data-dir` (systemd default: `/var/lib/thunderducks`):
 |------|----------|
 | `identity.key` | 32-byte ed25519 seed (mode `0600`) — stable device id across restarts |
 | `claim.json` | Owner claim: display name + recovery **hash** only (no plaintext code) |
+| `events.sqlite` | Signed event DAG (rooms + messages); WAL mode |
+| `e2ee.json` | Vodozemac Olm/Megolm pickles (encrypted fields) so history decrypts after reboot |
+| `meta.json` | Monotonic `ts_counter` |
 
 ```bash
 tducks serve --bind 127.0.0.1:8788 --data-dir /var/lib/thunderducks
 # or: TD_DATA_DIR=/var/lib/thunderducks tducks serve --bind 127.0.0.1:8788
 ```
 
-Without a data dir, claim/identity stay **in-memory** (tests / smoke only).
+Without a data dir, claim/identity/**events/e2ee** stay **in-memory** (tests / smoke only).
 
-Pair tokens remain short-lived and in-memory by design.
+**Still in-memory by design:** pair tokens, owner sessions (re-unlock with recovery code after restart).
+
+**Alpha note:** `v0.1.0-alpha.1` only persisted identity+claim. Rooms/messages durability requires **`v0.1.0-alpha.2+`**. Upgrade keeps the claim; create new rooms after upgrade (pre-upgrade chat was RAM-only).
 
 **Proxmox alpha guest (KVM/LXC + nginx UI):** [`proxmox-pond-alpha.md`](./proxmox-pond-alpha.md).
 

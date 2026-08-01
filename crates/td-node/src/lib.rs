@@ -533,6 +533,119 @@ mod tests {
     }
 
     #[test]
+    fn rooms_and_messages_survive_restart_with_data_dir() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "td-msg-dur-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let client = reqwest::Client::new();
+
+            let addr1 = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind 1");
+            let base1 = format!("http://{addr1}");
+
+            let claim: serde_json::Value = client
+                .post(format!("{base1}/v1/claim"))
+                .json(&serde_json::json!({"display_name": "Durable Chat"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(claim["ok"], true);
+
+            let room: serde_json::Value = client
+                .post(format!("{base1}/v1/rooms"))
+                .json(&serde_json::json!({"name": "alpha-room"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let room_id = room["room_id"].as_str().unwrap().to_string();
+
+            let sent_resp = client
+                .post(format!("{base1}/v1/messages"))
+                .json(&serde_json::json!({
+                    "room_id": room_id,
+                    "text": "survives reboot"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                sent_resp.status().is_success(),
+                "send status {} body {:?}",
+                sent_resp.status(),
+                sent_resp.text().await.ok()
+            );
+            // re-send not possible; parse from a second request path via list below
+            let listed1: serde_json::Value = client
+                .post(format!("{base1}/v1/messages/list"))
+                .json(&serde_json::json!({"room_id": room_id}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(listed1["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(listed1["messages"][0]["text"], "survives reboot");
+            let event_id = listed1["messages"][0]["event_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            // keep variable used — drop duplicate list below
+
+            // Simulate reboot: new listener, same data dir.
+            let addr2 = serve_with_data_dir("127.0.0.1:0", &dir)
+                .await
+                .expect("bind 2");
+            let base2 = format!("http://{addr2}");
+
+            let st: serde_json::Value = client
+                .get(format!("{base2}/v1/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(st["event_count"].as_u64().unwrap() >= 2);
+
+            let listed2: serde_json::Value = client
+                .post(format!("{base2}/v1/messages/list"))
+                .json(&serde_json::json!({"room_id": room_id}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(listed2["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(listed2["messages"][0]["event_id"], event_id);
+            assert_eq!(listed2["messages"][0]["text"], "survives reboot");
+
+            assert!(dir.join("events.sqlite").is_file());
+            assert!(dir.join("e2ee.json").is_file());
+            assert!(dir.join("meta.json").is_file());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
     fn remote_advertise_and_owner_gate_on_non_loopback() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

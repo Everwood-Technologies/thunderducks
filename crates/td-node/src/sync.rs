@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use td_crypto::DeviceId as CryptoDeviceId;
 use td_event::{
-    verify_event, DeviceId, EventId, EventKind, RoomDag, RoomId, SignedEvent, StoreError,
+    verify_event, DeviceId, EventId, EventKind, EventStore, RoomDag, RoomId, SignedEvent,
+    SqliteStore, StoreError,
 };
 use thiserror::Error;
 
@@ -52,6 +53,8 @@ pub struct DeviceNode {
     dags: HashMap<[u8; 32], RoomDag>,
     outbox: VecDeque<SignedEvent>,
     inbox: VecDeque<SignedEvent>,
+    /// Optional durable SQLite log (None = pure in-memory).
+    durable: Option<SqliteStore>,
 }
 
 impl DeviceNode {
@@ -62,11 +65,28 @@ impl DeviceNode {
             dags: HashMap::new(),
             outbox: VecDeque::new(),
             inbox: VecDeque::new(),
+            durable: None,
         }
     }
 
     pub fn from_crypto_device(id: CryptoDeviceId) -> Self {
         Self::new(DeviceId(id.0))
+    }
+
+    /// Open SQLite under `path`, reload all events into memory DAGs.
+    pub fn with_sqlite(
+        device_id: impl Into<DeviceId>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, SyncError> {
+        let mut node = Self::new(device_id);
+        let store = SqliteStore::open(path)?;
+        let events = store.list_all()?;
+        node.durable = Some(store);
+        for ev in events {
+            // Replay without outbox (historical).
+            let _ = node.ingest_event(ev, false)?;
+        }
+        Ok(node)
     }
 
     pub fn event_count(&self) -> usize {
@@ -137,6 +157,9 @@ impl DeviceNode {
         let inserted = dag.ingest(ev.clone())?;
         if inserted {
             self.events.insert(ev.id, ev.clone());
+            if let Some(store) = self.durable.as_mut() {
+                let _ = store.put(ev.clone())?;
+            }
             if to_outbox {
                 self.outbox.push_back(ev);
             }
@@ -164,7 +187,10 @@ impl DeviceNode {
                     .entry(ev.room_id.0)
                     .or_insert_with(|| RoomDag::new(ev.room_id));
                 if dag.ingest(ev.clone())? {
-                    self.events.insert(ev.id, ev);
+                    self.events.insert(ev.id, ev.clone());
+                    if let Some(store) = self.durable.as_mut() {
+                        let _ = store.put(ev)?;
+                    }
                     progress = true;
                 }
             }
