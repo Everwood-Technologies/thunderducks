@@ -21,7 +21,7 @@
 #
 # Env defaults (overridable):
 #   TDUCKS_VERSION=v0.1.0-alpha.1
-#   POND_PASSWORD=pond   (root/ubuntu password if not using SSH key only)
+#   POND_PASSWORD=pond1  (root/ubuntu password; Proxmox requires >= 5 chars)
 #   POND_SSH_KEY=        (path to pubkey; optional)
 #   POND_MEMORY_MB=2048  POND_CORES=2  POND_DISK_GB=16
 set -euo pipefail
@@ -37,7 +37,7 @@ LXC_TEMPLATE="" # empty → auto ubuntu-24.04
 MEMORY_MB="${POND_MEMORY_MB:-2048}"
 CORES="${POND_CORES:-2}"
 DISK_GB="${POND_DISK_GB:-16}"
-PASSWORD="${POND_PASSWORD:-pond}"
+PASSWORD="${POND_PASSWORD:-pond1}"
 SSH_KEY="${POND_SSH_KEY:-}"
 VERSION="${TDUCKS_VERSION:-v0.1.0-alpha.1}"
 REPO="${TDUCKS_REPO:-Everwood-Technologies/thunderducks}"
@@ -103,6 +103,7 @@ fi
 need_root
 [[ -n "$VMID" ]] || die "--id <vmid> required"
 [[ "$TYPE" == "lxc" || "$TYPE" == "kvm" ]] || die "--type must be lxc or kvm"
+[[ "${#PASSWORD}" -ge 5 ]] || die "password must be at least 5 characters (Proxmox rule); set --password or POND_PASSWORD"
 
 command -v pvesh >/dev/null 2>&1 || die "not a Proxmox host? (pvesh missing)"
 

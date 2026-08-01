@@ -52,7 +52,7 @@ Then open the printed `http://<ip>/` URL → **claim** → save recovery code of
 | `--type lxc\|kvm` | Guest kind (default **lxc**) |
 | `--id N` | CT/VM id |
 | `--force` | Destroy existing id first |
-| `--password …` | root (LXC) / cloud-init (KVM) password (default `pond`) |
+| `--password SECRET` | root (LXC) / cloud-init (KVM) password (default `pond1`, min 5 chars) |
 | `--ssh-key ~/.ssh/id_ed25519.pub` | Install pubkey |
 | `--ipconfig ip=192.168.1.50/24,gw=192.168.1.1` | Static net |
 | `--no-bootstrap` | Create only; print/run guest script yourself |
@@ -107,7 +107,7 @@ This installs:
 | nginx | **:80** on guest NIC (LAN) |
 | WAN | **Do not** port-forward :80/:8788 to the internet |
 | Remote | Tailscale on guest or PVE later; see [`remote-access.md`](./remote-access.md) |
-| Password | Change default `pond` immediately |
+| Password | Change default `pond1` immediately |
 
 Non-loopback access to admin APIs goes through nginx → still hits loopback tducks; **owner session** rules apply based on tducks bind (loopback remains trust-local for most routes). For stricter alpha, put the guest on a management VLAN / tailnet only.
 
