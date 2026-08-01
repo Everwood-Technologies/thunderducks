@@ -2,13 +2,41 @@
 
 ## Development
 
-1. Install a recent stable Rust toolchain (`rustup`).
-2. `cargo test --workspace`
-3. `cargo fmt` and `cargo clippy --workspace --all-targets`
+1. Install a recent stable Rust toolchain (`rustup`) and Node 22+ for clients.
+2. Rust:
+   ```bash
+   cargo test --workspace
+   cargo fmt --all
+   cargo clippy --workspace --all-targets -- -D warnings
+   ```
+3. Web client:
+   ```bash
+   cargo build -p tducks
+   cd clients/web && npm install && npm test
+   ```
+4. Widgets + bot:
+   ```bash
+   cargo build -p tducks
+   cd clients/widget-sdk && npm install && npm test
+   cd ../bot && npm test
+   ```
+5. Dev harness:
+   ```bash
+   ./scripts/dev-harness.sh
+   ```
+6. Benches (release):
+   ```bash
+   cargo run -p td-event --example ingest_bench --release
+   cargo run -p td-crypto --example e2ee_bench --release
+   ```
 
 ## Process
 
-Non-trivial changes follow AIDLC planning when material architecture is involved.
+Non-trivial architecture changes follow AIDLC planning when material.
+
+## Security
+
+See [SECURITY.md](./SECURITY.md). Do not file public issues for sensitive vulnerabilities.
 
 ## License
 
