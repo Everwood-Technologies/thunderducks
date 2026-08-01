@@ -10,7 +10,7 @@ Thunderducks is **not** production-hardened. Treat all releases before a future 
 
 ## Threat model
 
-See [`docs/threat-model.md`](./docs/threat-model.md). Design priority:
+See [`docs/threat-model.md`](./docs/threat-model.md) and the honest implementation diff [`docs/threat-model-diff.md`](./docs/threat-model-diff.md). Design priority:
 
 1. Malicious operator / relay  
 2. Network observer  

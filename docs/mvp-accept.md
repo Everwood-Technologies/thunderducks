@@ -34,12 +34,12 @@ Recorded against `main` (Waves A–F + P1.2/P1.3 harness). Legend: ✅ met · �
 
 | Criterion | Status |
 |-----------|--------|
-| Threat model matches impl (directional) | ⚠️ | Needs explicit diff pass (P1.4); no known contradiction |
+| Threat model matches impl (directional) | ✅ | [`docs/threat-model-diff.md`](./threat-model-diff.md) — gaps explicit (plaintext RPC path, no Noise/TLS, passkey stub) |
 | Widgets denied keys by test | ✅ | `clients/widget-sdk` security tests |
 | Relays untrusted in design + tests | ✅ | opaque envelopes; no plaintext API |
 
 ## MVP claim
 
-**M5 vertical slice: ACCEPTED with caveats** (WebAuthn still device-link stub; threat-model diff pass still open as P1.4). P1.2/P1.3 operator harness landed. Not production-ready.
+**M5 vertical slice: ACCEPTED with caveats.** P1.2–P1.4 landed. Strongest remaining caveats: default CLI/web path is **signed plaintext** over localhost RPC/raw TCP (vodozemac tested but not default wire path); passkeys stubbed; not production-ready.
 
-Next: `docs/post-mvp-backlog.md`, `docs/harness.md`.
+Next: `docs/post-mvp-backlog.md`, `docs/threat-model-diff.md`.

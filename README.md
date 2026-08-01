@@ -79,6 +79,7 @@ cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
 - [Operator harness](./docs/harness.md)
 - [Benches](./docs/bench.md)
 - [Threat model](./docs/threat-model.md)
+- [Threat model ↔ impl diff](./docs/threat-model-diff.md)
 - [Architecture](./docs/architecture.md)
 - [Security policy](./SECURITY.md)
 

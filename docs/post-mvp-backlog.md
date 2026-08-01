@@ -19,7 +19,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P1.1 | **WebAuthn / passkeys** (replace device-link stub as primary UX) | Gate 3 identity lock; docs still say passkeys | M–L; keep device-link as recovery |
 | P1.2 | **True multi-user P2P demo script** | ✅ done — `scripts/two-user-p2p.sh` + `td-node` example `two_user_p2p` | done |
 | P1.3 | **Relay + P2P coexistence script** | ✅ done — `scripts/relay-offline-catchup.sh` + example `relay_offline_catchup` | done |
-| P1.4 | Threat-model ↔ impl **diff pass** | Security review bar | S; annotate any drift |
+| P1.4 | Threat-model ↔ impl **diff pass** | ✅ done — `docs/threat-model-diff.md` | done |
 
 ## P2 — docs / public face
 
@@ -47,10 +47,11 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 1. P0.1 PAT rotate (human)  
 2. P0.2 SECURITY.md ✅  
 3. P1.2/P1.3 harness glue ✅  
-4. P1.4 threat-model ↔ impl diff  
+4. P1.4 threat-model ↔ impl diff ✅  
 5. P2.1 Pages when you want a public face  
 6. P1.1 WebAuthn when identity UX matters  
-7. P3.* as interest/funding allows  
+7. High/prod from P1.4: encrypt RPC payloads + transport auth  
+8. P3.* as interest/funding allows  
 
 ## Out of scope forever (unless new Gate)
 

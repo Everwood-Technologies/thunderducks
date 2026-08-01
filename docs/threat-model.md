@@ -101,7 +101,9 @@
 
 ## Review checklist (every wave)
 
-- [ ] Can a relay read or forge content? (must be no)
-- [ ] Can a widget touch keys? (must be no)
-- [ ] Does happy path still work P2P without relay?
-- [ ] Are new metadata leaks documented?
+- [x] Can a relay read or forge content? (must be no) — see `docs/threat-model-diff.md` (forge: no; plaintext API: no; seal quality caveat)
+- [x] Can a widget touch keys? (must be no) — widget-sdk CI
+- [x] Does happy path still work P2P without relay? — P1.2 harness
+- [x] Are new metadata leaks documented? — `docs/threat-model-diff.md` (P1.4)
+
+Full impl diff: [`docs/threat-model-diff.md`](./threat-model-diff.md).
