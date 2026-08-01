@@ -1,4 +1,4 @@
-/** Minimal localhost RPC client for td-node (Wave E2). */
+/** Minimal localhost RPC client for td-node (Wave E2 + multi-node). */
 
 export type Status = {
   device_id: string;
@@ -9,6 +9,7 @@ export type Status = {
   peers: { name: string; uri: string }[];
   passkey_credentials?: number;
   e2ee_default?: boolean;
+  p2p_uri?: string | null;
 };
 
 export type CreateRoomResponse = { room_id: string; event_id: string };
@@ -108,6 +109,32 @@ export class TdRpcClient {
     return (await r.json()) as { credentials: { credential_id: string; label: string }[] };
   }
 
+  async syncPeer(
+    peerRpc: string,
+    roomId: string,
+  ): Promise<{ ok: boolean; accepted_from_peer: number; pushed_accepted: number }> {
+    const r = await fetch(this.url("/v1/sync/peer"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_rpc: peerRpc, room_id: roomId }),
+    });
+    if (!r.ok) throw new Error(`syncPeer HTTP ${r.status}`);
+    return (await r.json()) as {
+      ok: boolean;
+      accepted_from_peer: number;
+      pushed_accepted: number;
+    };
+  }
+
+  async shareSession(peerRpc: string, roomId: string): Promise<void> {
+    const r = await fetch(this.url("/v1/e2ee/share-session"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_rpc: peerRpc, room_id: roomId }),
+    });
+    if (!r.ok) throw new Error(`shareSession HTTP ${r.status}`);
+  }
+
   async addPeer(name: string, uri: string): Promise<void> {
     const r = await fetch(this.url("/v1/peers"), {
       method: "POST",
@@ -120,43 +147,117 @@ export class TdRpcClient {
 
 /** In-browser UI bootstrap when loaded as a page script. */
 export function mountMinimalUi(root: HTMLElement, client: TdRpcClient): void {
+  const params = new URLSearchParams(location.search);
+  const presetRoom = params.get("room");
+  const nodeName = params.get("name") || "node";
+  const peerParam = params.get("peers") || "";
   root.innerHTML = `
-    <h1>Thunderducks</h1>
+    <h1>Thunderducks <small style="font-weight:normal;color:#666">${nodeName}</small></h1>
     <p id="status">connecting…</p>
-    <button id="link">Link secondary device</button>
-    <button id="room">Create room</button>
-    <input id="msg" placeholder="message" />
-    <button id="send">Send</button>
+    <p style="font-size:0.9rem;color:#444">
+      RPC <code id="rpcurl"></code>
+      · room <input id="roomId" placeholder="room hex" style="min-width:18rem" />
+    </p>
+    <div>
+      <button id="link">Link secondary</button>
+      <button id="room">Create room</button>
+      <button id="sync">Sync peers</button>
+      <button id="refresh">Refresh msgs</button>
+    </div>
+    <div style="margin-top:0.5rem">
+      <input id="msg" placeholder="message" />
+      <button id="send">Send</button>
+    </div>
+    <p style="font-size:0.85rem;color:#666">Peers (RPC): <input id="peers" style="min-width:22rem" placeholder="http://127.0.0.1:8789,http://127.0.0.1:8790" /></p>
     <pre id="log"></pre>
   `;
+  (root.querySelector("#rpcurl") as HTMLElement).textContent = client.baseUrl;
+  const roomInput = root.querySelector("#roomId") as HTMLInputElement;
+  const peersInput = root.querySelector("#peers") as HTMLInputElement;
+  if (presetRoom) roomInput.value = presetRoom;
+  if (peerParam) peersInput.value = peerParam;
+  else {
+    const u = client.baseUrl.replace(/\/$/, "");
+    const defaults = [
+      "http://127.0.0.1:8788",
+      "http://127.0.0.1:8789",
+      "http://127.0.0.1:8790",
+    ].filter((p) => p !== u);
+    peersInput.value = defaults.join(",");
+  }
   const log = (s: string) => {
     const el = root.querySelector("#log") as HTMLPreElement;
     el.textContent = `${s}\n${el.textContent ?? ""}`;
   };
-  let roomId: string | null = null;
+  const peerList = () =>
+    peersInput.value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
   void client.status().then((st) => {
     (root.querySelector("#status") as HTMLElement).textContent =
-      `device ${st.device_id.slice(0, 12)}… events=${st.event_count} e2ee=${st.e2ee_default ?? false} passkeys=${st.passkey_credentials ?? 0}`;
+      `device ${st.device_id.slice(0, 12)}… events=${st.event_count} e2ee=${st.e2ee_default ?? false} p2p=${st.p2p_uri ?? "—"}`;
   });
+
   root.querySelector("#link")!.addEventListener("click", () => {
-    void client.linkSecondary().then((r) => log(`linked secondary ${r.secondary_device.slice(0, 12)}…`));
+    void client
+      .linkSecondary()
+      .then((r) => log(`linked secondary ${r.secondary_device.slice(0, 12)}…`));
   });
   root.querySelector("#room")!.addEventListener("click", () => {
-    void client.createRoom("web-pond").then((r) => {
-      roomId = r.room_id;
-      log(`room ${roomId.slice(0, 12)}…`);
+    void client.createRoom(`web-${nodeName}`).then((r) => {
+      roomInput.value = r.room_id;
+      log(`room ${r.room_id.slice(0, 12)}…`);
     });
+  });
+  root.querySelector("#sync")!.addEventListener("click", () => {
+    const roomId = roomInput.value.trim();
+    if (!roomId) {
+      log("set room id first");
+      return;
+    }
+    void (async () => {
+      for (const peer of peerList()) {
+        try {
+          const s = await client.syncPeer(peer, roomId);
+          log(`sync ${peer}: from_peer=${s.accepted_from_peer} pushed=${s.pushed_accepted}`);
+          await client.shareSession(peer, roomId).catch(() => undefined);
+        } catch (e) {
+          log(`sync fail ${peer}: ${(e as Error).message}`);
+        }
+      }
+      const msgs = await client.listMessages(roomId);
+      log(JSON.stringify(msgs.messages, null, 2));
+    })();
+  });
+  root.querySelector("#refresh")!.addEventListener("click", () => {
+    const roomId = roomInput.value.trim();
+    if (!roomId) return;
+    void client
+      .listMessages(roomId)
+      .then((msgs) => log(JSON.stringify(msgs.messages, null, 2)));
   });
   root.querySelector("#send")!.addEventListener("click", () => {
     const text = (root.querySelector("#msg") as HTMLInputElement).value || "honk";
+    const roomId = roomInput.value.trim();
     if (!roomId) {
-      log("create a room first");
+      log("set room id first");
       return;
     }
-    void client.send(roomId, text).then(async (s) => {
+    void (async () => {
+      const s = await client.send(roomId, text);
       log(`sent ${s.event_id.slice(0, 12)}…`);
-      const msgs = await client.listMessages(roomId!);
+      for (const peer of peerList()) {
+        try {
+          await client.shareSession(peer, roomId);
+          await client.syncPeer(peer, roomId);
+        } catch {
+          /* best-effort */
+        }
+      }
+      const msgs = await client.listMessages(roomId);
       log(JSON.stringify(msgs.messages, null, 2));
-    });
+    })();
   });
 }

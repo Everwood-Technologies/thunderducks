@@ -8,17 +8,19 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use td_crypto::{DeviceKeypair, E2eeDevice, LinkRegistry, MegolmCiphertext, PasskeyRegistry};
 use td_event::{
     sign_event, DeviceId, EventId, EventKind, RoomId, RoomRegistry, SignedEvent, UnsignedEvent,
 };
+use td_net::{accept_once, dial, read_event, write_event, PeerUri};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::sync::DeviceNode;
+use crate::sync::{DeviceNode, SyncOffer};
 
 #[derive(Clone)]
 pub struct RpcState {
@@ -29,7 +31,7 @@ struct NodeSession {
     keypair: DeviceKeypair,
     node: DeviceNode,
     rooms: RoomRegistry,
-    /// room_id hex -> last parents (tips) cache via node
+    /// peer name -> uri (`td://host:port` P2P and/or `http://host:port` RPC)
     peers: HashMap<String, String>,
     link: LinkRegistry,
     passkeys: PasskeyRegistry,
@@ -37,6 +39,8 @@ struct NodeSession {
     /// rooms with outbound Megolm session established
     e2ee_rooms: HashMap<String, bool>,
     ts_counter: u64,
+    /// local P2P listen URI once started
+    p2p_uri: Option<String>,
 }
 
 impl NodeSession {
@@ -56,6 +60,7 @@ impl NodeSession {
             e2ee,
             e2ee_rooms: HashMap::new(),
             ts_counter: 1,
+            p2p_uri: None,
         }
     }
 
@@ -71,6 +76,19 @@ impl NodeSession {
         let _ = self.e2ee.create_group_session(room_hex);
         self.e2ee_rooms.insert(room_hex.to_string(), true);
     }
+
+    /// Ingest a remote signed event into DAG + room registry.
+    fn ingest_remote(&mut self, ev: SignedEvent) -> Result<bool, String> {
+        let kind = ev.kind;
+        let inserted = self
+            .node
+            .commit_remote(ev.clone())
+            .map_err(|e| e.to_string())?;
+        if matches!(kind, EventKind::CreateRoom | EventKind::Membership) {
+            let _ = self.rooms.apply_event(ev);
+        }
+        Ok(inserted)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +101,7 @@ pub struct StatusResponse {
     pub peers: Vec<PeerInfo>,
     pub passkey_credentials: usize,
     pub e2ee_default: bool,
+    pub p2p_uri: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -244,6 +263,7 @@ async fn status(State(st): State<RpcState>) -> impl IntoResponse {
         peers,
         passkey_credentials: g.passkeys.credential_count(),
         e2ee_default: true,
+        p2p_uri: g.p2p_uri.clone(),
     })
 }
 
@@ -364,11 +384,26 @@ async fn send_message(
         )
             .into_response();
     }
-    Json(SendResponse {
-        event_id: hex32(&signed.id.0),
-        ts_ms: signed.ts_ms,
-    })
-    .into_response()
+    let event_id = hex32(&signed.id.0);
+    let ts_ms = signed.ts_ms;
+    let room_for_push = room_id;
+    let peers_snapshot: Vec<String> = g.peers.values().cloned().collect();
+    let events_to_push = g.node.list_events(&room_for_push);
+    drop(g);
+    // Best-effort P2P fanout of full room DAG (parent-before-child).
+    for uri in peers_snapshot {
+        if let Ok(peer) = PeerUri::parse(&uri) {
+            let bundle = events_to_push.clone();
+            tokio::spawn(async move {
+                if let Ok(mut sock) = dial(&peer).await {
+                    for ev in bundle {
+                        let _ = write_event(&mut sock, &ev).await;
+                    }
+                }
+            });
+        }
+    }
+    Json(SendResponse { event_id, ts_ms }).into_response()
 }
 
 async fn list_messages(
@@ -590,6 +625,330 @@ async fn passkey_list(State(st): State<RpcState>) -> impl IntoResponse {
     Json(serde_json::json!({"credentials": creds})).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SyncOfferRequest {
+    pub room_id: String,
+    #[serde(default)]
+    pub have: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncOfferHttpResponse {
+    pub room_id: String,
+    pub missing: Vec<SignedEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncIngestRequest {
+    pub events: Vec<SignedEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncPeerRequest {
+    /// Peer node HTTP RPC base, e.g. http://127.0.0.1:8789
+    pub peer_rpc: String,
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionKeyRequest {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionImportRequest {
+    pub session_key_b64: String,
+}
+
+async fn sync_offer(
+    State(st): State<RpcState>,
+    Json(req): Json<SyncOfferRequest>,
+) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    let room_id = match parse_room_id(&req.room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+        }
+    };
+    let mut have = HashSet::new();
+    for h in req.have {
+        if let Ok(b) = hex::decode(&h) {
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                have.insert(EventId(a));
+            }
+        }
+    }
+    let offer = SyncOffer {
+        from_device: g.node.device_id,
+        room_id,
+        tips: g.node.tips(&room_id),
+        have: have.into_iter().collect(),
+    };
+    // Peer is asking us for what they lack: respond with our missing-for-them.
+    let resp = g.node.respond_to_offer(&offer);
+    Json(SyncOfferHttpResponse {
+        room_id: req.room_id,
+        missing: resp.missing,
+    })
+    .into_response()
+}
+
+async fn sync_ingest(
+    State(st): State<RpcState>,
+    Json(req): Json<SyncIngestRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let mut accepted = 0usize;
+    let mut errors = Vec::new();
+    for ev in req.events {
+        match g.ingest_remote(ev) {
+            Ok(true) => accepted += 1,
+            Ok(false) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+    Json(serde_json::json!({ "accepted": accepted, "errors": errors })).into_response()
+}
+
+async fn sync_peer(
+    State(st): State<RpcState>,
+    Json(req): Json<SyncPeerRequest>,
+) -> impl IntoResponse {
+    let room_id = match parse_room_id(&req.room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+        }
+    };
+    let peer_base = req.peer_rpc.trim_end_matches('/').to_string();
+    let room_hex = req.room_id.clone();
+
+    // Snapshot our have-set and events under lock.
+    let (our_have, our_events) = {
+        let g = st.inner.lock().await;
+        let have: Vec<String> = g
+            .node
+            .room_event_ids(&room_id)
+            .into_iter()
+            .map(|id| hex32(&id.0))
+            .collect();
+        let events = g.node.list_events(&room_id);
+        (have, events)
+    };
+
+    let client = match reqwest_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody { error: e }),
+            )
+                .into_response();
+        }
+    };
+
+    // Pull missing from peer.
+    let pull_body = serde_json::json!({ "room_id": room_hex, "have": our_have });
+    let pulled: SyncOfferHttpResponse = match client
+        .post(format!("{peer_base}/v1/sync/offer"))
+        .json(&pull_body)
+        .send()
+        .await
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorBody {
+                        error: format!("peer offer decode: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("peer offer: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let mut accepted_from_peer = 0usize;
+    {
+        let mut g = st.inner.lock().await;
+        for ev in pulled.missing {
+            if g.ingest_remote(ev).unwrap_or(false) {
+                accepted_from_peer += 1;
+            }
+        }
+    }
+
+    // Push our events to peer ingest.
+    let push_body = serde_json::json!({ "events": our_events });
+    let pushed_accepted = match client
+        .post(format!("{peer_base}/v1/sync/ingest"))
+        .json(&push_body)
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("accepted").and_then(|x| x.as_u64()))
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "accepted_from_peer": accepted_from_peer,
+        "pushed_accepted": pushed_accepted,
+        "peer_rpc": peer_base,
+        "room_id": room_hex,
+    }))
+    .into_response()
+}
+
+async fn export_session(
+    State(st): State<RpcState>,
+    Json(req): Json<SessionKeyRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    let room_hex = req.room_id;
+    g.ensure_room_e2ee(&room_hex);
+    match g.e2ee.export_group_session_key(&room_hex) {
+        Ok(session_key_b64) => {
+            let session_id = g.e2ee.group_session_id(&room_hex).unwrap_or_default();
+            Json(serde_json::json!({
+                "room_id": room_hex,
+                "session_id": session_id,
+                "session_key_b64": session_key_b64,
+                "sender_device": hex32(&g.keypair.device_id().0),
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn import_session(
+    State(st): State<RpcState>,
+    Json(req): Json<SessionImportRequest>,
+) -> impl IntoResponse {
+    let mut g = st.inner.lock().await;
+    match g.e2ee.import_group_session_key(&req.session_key_b64) {
+        Ok(session_id) => {
+            Json(serde_json::json!({ "ok": true, "session_id": session_id })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn share_session_with_peer(
+    State(st): State<RpcState>,
+    Json(req): Json<SyncPeerRequest>,
+) -> impl IntoResponse {
+    // Export our megolm key for room and POST import to peer (localhost demo path).
+    let room_hex = req.room_id.clone();
+    let peer_base = req.peer_rpc.trim_end_matches('/').to_string();
+    let (session_key_b64, session_id, sender) = {
+        let mut g = st.inner.lock().await;
+        g.ensure_room_e2ee(&room_hex);
+        match g.e2ee.export_group_session_key(&room_hex) {
+            Ok(k) => (
+                k,
+                g.e2ee.group_session_id(&room_hex).unwrap_or_default(),
+                hex32(&g.keypair.device_id().0),
+            ),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let client = match reqwest_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody { error: e }),
+            )
+                .into_response();
+        }
+    };
+    match client
+        .post(format!("{peer_base}/v1/e2ee/import-session"))
+        .json(&serde_json::json!({ "session_key_b64": session_key_b64 }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => Json(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "sender_device": sender,
+            "peer_rpc": peer_base,
+            "room_id": room_hex,
+        }))
+        .into_response(),
+        Ok(r) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody {
+                error: format!("peer import HTTP {}", r.status()),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody {
+                error: format!("peer import: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn reqwest_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+async fn p2p_status(State(st): State<RpcState>) -> impl IntoResponse {
+    let g = st.inner.lock().await;
+    Json(serde_json::json!({
+        "p2p_uri": g.p2p_uri,
+        "peers": g.peers,
+    }))
+    .into_response()
+}
+
 /// Build the localhost RPC router.
 pub fn router(state: RpcState) -> Router {
     let cors = CorsLayer::new()
@@ -616,6 +975,13 @@ pub fn router(state: RpcState) -> Router {
         .route("/v1/rooms", post(create_room))
         .route("/v1/messages", post(send_message))
         .route("/v1/messages/list", post(list_messages))
+        .route("/v1/sync/offer", post(sync_offer))
+        .route("/v1/sync/ingest", post(sync_ingest))
+        .route("/v1/sync/peer", post(sync_peer))
+        .route("/v1/e2ee/export-session", post(export_session))
+        .route("/v1/e2ee/import-session", post(import_session))
+        .route("/v1/e2ee/share-session", post(share_session_with_peer))
+        .route("/v1/p2p", get(p2p_status))
         .layer(cors)
         .with_state(state)
 }
@@ -626,12 +992,48 @@ pub fn new_state() -> RpcState {
     }
 }
 
+async fn start_p2p_listener(state: RpcState) -> Result<String, std::io::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let uri = PeerUri::from_tcp_addr(addr).to_string_uri();
+    {
+        let mut g = state.inner.lock().await;
+        g.p2p_uri = Some(uri.clone());
+    }
+    let st = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let mut sock = match accept_once(&listener).await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let st2 = st.clone();
+            tokio::spawn(async move {
+                loop {
+                    match read_event(&mut sock).await {
+                        Ok(ev) => {
+                            let mut g = st2.inner.lock().await;
+                            let _ = g.ingest_remote(ev);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    Ok(uri)
+}
+
 /// Serve RPC on `bind` (e.g. 127.0.0.1:8788). Returns local addr after bind.
 pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
     let state = new_state();
+    let p2p = start_p2p_listener(state.clone())
+        .await
+        .unwrap_or_else(|_| "td://?".into());
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
+    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -641,10 +1043,11 @@ pub async fn serve(bind: &str) -> Result<SocketAddr, std::io::Error> {
 /// Serve and block (for binary embedding).
 pub async fn serve_blocking(bind: &str) -> Result<(), std::io::Error> {
     let state = new_state();
+    let p2p = start_p2p_listener(state.clone()).await?;
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
-    eprintln!("td-node rpc listening on http://{addr}");
+    eprintln!("td-node rpc listening on http://{addr} p2p={p2p}");
     axum::serve(listener, app).await
 }
 
