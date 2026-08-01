@@ -69,8 +69,8 @@ fi
 if [[ "$SKIP_NGINX" != "1" ]]; then
   log "deploy pond web UI → ${WEB_ROOT}"
   mkdir -p "${WEB_ROOT}/dist"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  POND_WEB_TMP="$(mktemp -d)"
+  trap 'rm -rf "${POND_WEB_TMP:-}" 2>/dev/null || true' EXIT
 
   # Prefer sparse raw fetches (no full git clone required).
   fetch() {
@@ -80,18 +80,18 @@ if [[ "$SKIP_NGINX" != "1" ]]; then
   }
 
   fetch clients/web/index.html "${WEB_ROOT}/index.html"
-  fetch clients/web/package.json "${tmp}/package.json"
-  fetch clients/web/package-lock.json "${tmp}/package-lock.json" || true
-  fetch clients/web/tsconfig.json "${tmp}/tsconfig.json"
-  mkdir -p "${tmp}/src"
-  fetch clients/web/src/rpc.ts "${tmp}/src/rpc.ts"
-  fetch clients/web/src/index.ts "${tmp}/src/index.ts"
-  fetch clients/web/src/smoke.test.ts "${tmp}/src/smoke.test.ts" || true
+  fetch clients/web/package.json "${POND_WEB_TMP}/package.json"
+  fetch clients/web/package-lock.json "${POND_WEB_TMP}/package-lock.json" || true
+  fetch clients/web/tsconfig.json "${POND_WEB_TMP}/tsconfig.json"
+  mkdir -p "${POND_WEB_TMP}/src"
+  fetch clients/web/src/rpc.ts "${POND_WEB_TMP}/src/rpc.ts"
+  fetch clients/web/src/index.ts "${POND_WEB_TMP}/src/index.ts"
+  fetch clients/web/src/smoke.test.ts "${POND_WEB_TMP}/src/smoke.test.ts" || true
 
   if command -v npm >/dev/null 2>&1 || apt-get install -y --no-install-recommends npm >/dev/null 2>&1; then
     log "build web client (tsc)"
     (
-      cd "$tmp"
+      cd "${POND_WEB_TMP}"
       # Minimal build: only need dist/rpc.js + types optional
       npm install --no-audit --no-fund >/dev/null
       npx --yes tsc -p tsconfig.json

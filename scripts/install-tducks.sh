@@ -79,16 +79,30 @@ script_dir() {
 
 install_ota_helper() {
   mkdir -p "$LIB_DIR"
-  local src_helper
+  local src_helper=""
+  local ota_tmp=""
   src_helper="$(script_dir)/tducks-ota-apply.sh"
   if [[ ! -f "$src_helper" ]]; then
-    # curl|bash install may only have this script; embed minimal fallback later
     if [[ -f "./scripts/tducks-ota-apply.sh" ]]; then
       src_helper="./scripts/tducks-ota-apply.sh"
+    elif [[ -f "./tducks-ota-apply.sh" ]]; then
+      src_helper="./tducks-ota-apply.sh"
+    else
+      # curl|bash: only this script is in the pipe — fetch helper from GitHub raw
+      ota_tmp="$(mktemp)"
+      if curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/tducks-ota-apply.sh" \
+        -o "$ota_tmp" 2>/dev/null && [[ -s "$ota_tmp" ]]; then
+        src_helper="$ota_tmp"
+      else
+        rm -f "$ota_tmp" 2>/dev/null || true
+        echo "warn: tducks-ota-apply.sh not found — OTA auto-apply helper skipped" >&2
+        return 0
+      fi
     fi
   fi
   if [[ -f "$src_helper" ]]; then
     install -m 0755 "$src_helper" "$OTA_HELPER_DST"
+    [[ -n "$ota_tmp" ]] && rm -f "$ota_tmp" || true
   else
     echo "warn: tducks-ota-apply.sh not found next to installer — OTA auto-apply helper skipped" >&2
     return 0
@@ -169,7 +183,9 @@ download_release() {
   asset="tducks-${VERSION}-${target}.tar.gz"
   url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  # Use global path so EXIT trap under set -u does not expand an unbound local.
+  TDUCKS_DOWNLOAD_TMP="$tmp"
+  trap 'rm -rf "${TDUCKS_DOWNLOAD_TMP:-}" 2>/dev/null || true' EXIT
   echo "downloading $url"
   curl -fsSL -o "$tmp/$asset" "$url" || die "download failed — is release $VERSION published for $target?"
   tar -xzf "$tmp/$asset" -C "$tmp"
@@ -183,6 +199,25 @@ download_release() {
     found="$(find "$tmp" -type f -name tducks | head -1)"
     [[ -n "$found" ]] || die "tducks binary missing inside $asset"
     install_from_file "$found"
+  fi
+  # Keep tarball dir until process exit so we can pull OTA helper from it if present.
+  if [[ -f "$tmp/tducks-ota-apply.sh" ]]; then
+    : # install_ota_helper will also try raw; leave file for same-dir discovery if cwd is tmp
+  fi
+  # Prefer helper packaged inside the release tarball
+  if [[ -f "$tmp/tducks-ota-apply.sh" ]]; then
+    mkdir -p "$LIB_DIR"
+    install -m 0755 "$tmp/tducks-ota-apply.sh" "$OTA_HELPER_DST"
+  elif [[ -f "$tmp/tducks-${VERSION}-${target}/tducks-ota-apply.sh" ]]; then
+    mkdir -p "$LIB_DIR"
+    install -m 0755 "$tmp/tducks-${VERSION}-${target}/tducks-ota-apply.sh" "$OTA_HELPER_DST"
+  else
+    local found_helper
+    found_helper="$(find "$tmp" -type f -name tducks-ota-apply.sh | head -1 || true)"
+    if [[ -n "$found_helper" ]]; then
+      mkdir -p "$LIB_DIR"
+      install -m 0755 "$found_helper" "$OTA_HELPER_DST"
+    fi
   fi
 }
 
