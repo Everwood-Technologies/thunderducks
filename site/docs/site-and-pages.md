@@ -1,6 +1,6 @@
 # Docs + marketing site (GitHub Pages)
 
-**Status:** Enabled — static `site/` + GitHub Actions Pages workflow  
+**Status:** Planned — enable when ready (not blocking MVP protocol waves)  
 **Owner decision (2026-07-31):** Serve **docs and marketing** via **GitHub Pages**.
 
 ## Goals
@@ -24,12 +24,12 @@
 
 ## Enable checklist (execute later)
 
-- [x] Minimal `site/index.html` marketing page  
-- [x] Docs index + rendered markdown pages  
-- [x] Workflow `.github/workflows/pages.yml`  
-- [x] Pages source = GitHub Actions (API already `build_type: workflow`)  
-- [ ] Smoke-check published URL after first deploy  
-- [x] README link to the site  
+- [ ] Minimal `site/index.html` (or SSG) marketing page  
+- [ ] Docs index linking `threat-model.md`, `architecture.md`, README  
+- [ ] Workflow `.github/workflows/pages.yml` (peaceable with existing `ci.yml`)  
+- [ ] Repo Settings → Pages → source = GitHub Actions  
+- [ ] Smoke-check published URL  
+- [ ] README badge/link to the site  
 
 ## Non-blocking rule
 

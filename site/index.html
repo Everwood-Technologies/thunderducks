@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Thunderducks — E2EE P2P chat, no tokens</title>
+  <meta name="description" content="Event-driven, maximally decentralized hybrid P2P E2EE chat. AGPL-3.0. No tokens, no blockchain bus." />
+  <link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+  <header class="wrap">
+    <p class="brand">🦆 Thunderducks</p>
+    <nav>
+      <a href="#get-started">Get started</a>
+      <a href="docs/">Docs</a>
+      <a href="https://github.com/Everwood-Technologies/thunderducks">GitHub</a>
+    </nav>
+  </header>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Event-driven E2EE chat.<br/>P2P-first. No tokens.</h1>
+      <p class="lede">
+        Thunderducks is a federated hybrid P2P messenger with end-to-end encryption
+        for 1:1 and groups, multi-device identity, developer widgets, and an optional
+        <strong>untrusted</strong> relay assist. Relays never get a plaintext API.
+      </p>
+      <p class="cta">
+        <a class="btn primary" href="https://github.com/Everwood-Technologies/thunderducks">View on GitHub</a>
+        <a class="btn" href="docs/">Read the docs</a>
+      </p>
+    </section>
+    <section class="grid">
+      <article>
+        <h2>What it is</h2>
+        <ul>
+          <li>Signed events + per-room causal DAG</li>
+          <li>vodozemac Olm / Megolm (1:1 + groups)</li>
+          <li>Rust core + CLI (<code>tducks</code>) + TypeScript web</li>
+          <li>iframe widgets, deny-by-default permissions</li>
+          <li>AGPL-3.0-only</li>
+        </ul>
+      </article>
+      <article>
+        <h2>What it is not</h2>
+        <ul>
+          <li>No tokens, gas, or L1 bus</li>
+          <li>No mandatory global DHT</li>
+          <li>No “trust the relay with content”</li>
+          <li>Not production-hardened yet (M5 MVP with caveats)</li>
+        </ul>
+      </article>
+    </section>
+    <section id="get-started">
+      <h2>Get started</h2>
+      <pre><code>git clone https://github.com/Everwood-Technologies/thunderducks.git
+cd thunderducks
+cargo test --workspace
+cargo run -p tducks -- serve --bind 127.0.0.1:8788
+# other terminal
+cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
+./scripts/dev-harness.sh</code></pre>
+    </section>
+    <section>
+      <h2>Docs</h2>
+      <ul class="docs">
+        <li><a href="docs/threat-model.html">Threat model</a></li>
+        <li><a href="docs/threat-model-diff.html">Threat model ↔ impl diff</a></li>
+        <li><a href="docs/architecture.html">Architecture</a></li>
+        <li><a href="docs/mvp-accept.html">MVP accept checklist</a></li>
+        <li><a href="docs/harness.html">Operator harness</a></li>
+        <li><a href="docs/bench.html">Benches</a></li>
+        <li><a href="docs/post-mvp-backlog.html">Post-MVP backlog</a></li>
+        <li><a href="docs/SECURITY.html">Security policy</a></li>
+      </ul>
+    </section>
+  </main>
+  <footer class="wrap">
+    <p>Everwood Technologies · <a href="https://github.com/Everwood-Technologies/thunderducks">source</a> · AGPL-3.0-only</p>
+  </footer>
+</body>
+</html>

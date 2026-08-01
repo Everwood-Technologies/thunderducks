@@ -25,7 +25,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 
 | ID | Item | Why |
 |----|------|-----|
-| P2.1 | **GitHub Pages** flip | ✅ done — `site/` + `.github/workflows/pages.yml` |
+| P2.1 | **GitHub Pages** flip (`docs/site-and-pages.md`) | Marketing + docs URL |
 | P2.2 | Expand CONTRIBUTING (widget/bot test commands, harness) | Onboarding |
 | P2.3 | Protocol notes (event encoding, room membership, relay envelope) | External contributors |
 | P2.4 | README badges (CI, license, pages when live) | Polish |

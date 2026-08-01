@@ -11,3 +11,6 @@ dist/
 *.sqlite-journal
 .idea/
 .vscode/
+
+# generated pages
+site/_site/

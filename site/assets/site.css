@@ -1,0 +1,59 @@
+:root {
+  --bg: #0b1020;
+  --card: #141a2e;
+  --text: #e8ecf7;
+  --muted: #a7b0c8;
+  --accent: #7dd3fc;
+  --accent2: #fbbf24;
+  --border: #243049;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: var(--sans);
+  background: radial-gradient(1200px 600px at 10% -10%, #1a2744, transparent),
+              radial-gradient(900px 500px at 100% 0%, #1b1630, transparent),
+              var(--bg);
+  color: var(--text);
+  line-height: 1.55;
+}
+a { color: var(--accent); }
+.wrap { width: min(960px, 92vw); margin: 0 auto; }
+header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 1.25rem 0; border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; margin: 0; letter-spacing: 0.02em; }
+nav a { margin-left: 1rem; text-decoration: none; color: var(--muted); }
+nav a:hover { color: var(--text); }
+.hero { padding: 3rem 0 1.5rem; }
+.hero h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); line-height: 1.15; margin: 0 0 1rem; }
+.lede { color: var(--muted); font-size: 1.1rem; max-width: 42rem; }
+.cta { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1.5rem; }
+.btn {
+  display: inline-block; padding: 0.65rem 1rem; border-radius: 10px;
+  border: 1px solid var(--border); text-decoration: none; color: var(--text);
+  background: var(--card);
+}
+.btn.primary { background: #0ea5e9; border-color: #0ea5e9; color: #041018; font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin: 1rem 0 2rem; }
+article, section {
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+section h2, article h2 { margin-top: 0; }
+pre {
+  overflow: auto; background: #070b16; border: 1px solid var(--border);
+  border-radius: 10px; padding: 1rem; font-family: var(--mono); font-size: 0.88rem;
+}
+code { font-family: var(--mono); }
+.docs { padding-left: 1.1rem; }
+footer { color: var(--muted); padding: 2rem 0 3rem; font-size: 0.9rem; }
+/* docs pages */
+.docs-body { padding: 2rem 0 3rem; }
+.docs-body pre { white-space: pre-wrap; }
+.docs-nav { margin: 1rem 0 1.5rem; }
+.docs-nav a { margin-right: 0.75rem; }

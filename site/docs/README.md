@@ -8,8 +8,6 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 
 **M5 accepted (with caveats)** — Waves A–F shipped. See [`docs/mvp-accept.md`](./docs/mvp-accept.md) and [`docs/post-mvp-backlog.md`](./docs/post-mvp-backlog.md).
 
-**Site:** https://everwood-technologies.github.io/thunderducks/
-
 | Layer | Choice |
 |-------|--------|
 | Core | Rust-first monorepo |
