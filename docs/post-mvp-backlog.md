@@ -48,6 +48,7 @@ Honest MVP status: the construction plan is **shipped**. Gaps below are real; no
 | P3.4 | **Full RPC authn + rate limits** (non-loopback owner gate + per-IP limits) | ✅ done |
 | P3.5 | Widget permission UX in web UI (grant/revoke UI) |
 | P3.5b | **OTA + Wi‑Fi wizard first slice** (`/v1/ota/*`, `/v1/wifi/*`) | ✅ done |
+| P3.5c | **OTA auto-apply + restart** (pending.json + path unit + helper) | ✅ done |
 | P3.6 | Mobile / Tauri (explicitly deferred) |
 | P3.7 | Metadata-privacy hardening (not MVP) |
 

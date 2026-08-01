@@ -306,7 +306,7 @@ Current repo: strong node MVP; **packaging + claim UX + remote path** are the ga
 | **C — packaging** | ✅ `docs/install.md`, `scripts/install-tducks.sh`, `packaging/systemd/tducks.service`, `.github/workflows/release.yml` (tag `v*`) |
 | **P2 — claim wizard + pairing** | ✅ RPC + web first-run UI |
 | **Remote both (tailnet + relay UX)** | ✅ first slice — `docs/remote-access.md` (`TD_ADVERTISE_HOST`, `TD_P2P_BIND`, `TD_RELAY_URI`, owner gate) |
-| **OTA / Wi‑Fi first slice** | ✅ `/v1/ota/*` + `/v1/wifi/*` — `docs/ota-wifi.md` |
+| **OTA / Wi‑Fi** | ✅ auto-apply + restart (`pending.json` + path unit) — `docs/ota-wifi.md` |
 | **Retail image** | after DIY install + OTA apply automation is boring |
 
 ---

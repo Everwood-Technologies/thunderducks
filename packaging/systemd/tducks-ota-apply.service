@@ -1,0 +1,20 @@
+[Unit]
+Description=Thunderducks OTA apply (install staged binary + restart)
+Documentation=https://github.com/Everwood-Technologies/thunderducks/blob/main/docs/ota-wifi.md
+After=network-online.target
+ConditionPathExists=/var/lib/thunderducks/ota/pending.json
+
+[Service]
+Type=oneshot
+User=root
+Environment=TD_DATA_DIR=/var/lib/thunderducks
+Environment=TD_OTA_BIN_PATH=/usr/bin/tducks
+Environment=TD_OTA_UNIT=tducks.service
+EnvironmentFile=-/etc/thunderducks/tducks.env
+ExecStart=/usr/lib/thunderducks/tducks-ota-apply.sh
+Nice=5
+# Brief window; install is local disk only.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

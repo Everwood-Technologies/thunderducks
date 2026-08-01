@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch Thunderducks OTA pending.json and trigger apply
+Documentation=https://github.com/Everwood-Technologies/thunderducks/blob/main/docs/ota-wifi.md
+
+[Path]
+# Node (user tducks) writes pending.json; this path unit elevates install.
+PathExists=/var/lib/thunderducks/ota/pending.json
+Unit=tducks-ota-apply.service
+
+[Install]
+WantedBy=multi-user.target

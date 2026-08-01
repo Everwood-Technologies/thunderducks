@@ -20,7 +20,11 @@ VERSION="${TDUCKS_VERSION:-latest}"
 BIND="${TDUCKS_BIND:-127.0.0.1:8788}"
 PREFIX="${TDUCKS_PREFIX:-/usr}"
 UNIT_DST="/etc/systemd/system/tducks.service"
+OTA_UNIT_DST="/etc/systemd/system/tducks-ota-apply.service"
+OTA_PATH_DST="/etc/systemd/system/tducks-ota-apply.path"
 BIN_DST="${PREFIX}/bin/tducks"
+LIB_DIR="${PREFIX}/lib/thunderducks"
+OTA_HELPER_DST="${LIB_DIR}/tducks-ota-apply.sh"
 DATA_DIR="/var/lib/thunderducks"
 CONF_DIR="/etc/thunderducks"
 FROM_FILE=""
@@ -62,9 +66,85 @@ ensure_user() {
   if ! id tducks &>/dev/null; then
     useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin tducks
   fi
-  mkdir -p "$DATA_DIR" "$CONF_DIR"
+  mkdir -p "$DATA_DIR" "$CONF_DIR" "$DATA_DIR/ota"
   chown -R tducks:tducks "$DATA_DIR"
   chmod 750 "$DATA_DIR"
+  chmod 750 "$DATA_DIR/ota"
+}
+
+script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  cd "$(dirname "$src")" && pwd
+}
+
+install_ota_helper() {
+  mkdir -p "$LIB_DIR"
+  local src_helper
+  src_helper="$(script_dir)/tducks-ota-apply.sh"
+  if [[ ! -f "$src_helper" ]]; then
+    # curl|bash install may only have this script; embed minimal fallback later
+    if [[ -f "./scripts/tducks-ota-apply.sh" ]]; then
+      src_helper="./scripts/tducks-ota-apply.sh"
+    fi
+  fi
+  if [[ -f "$src_helper" ]]; then
+    install -m 0755 "$src_helper" "$OTA_HELPER_DST"
+  else
+    echo "warn: tducks-ota-apply.sh not found next to installer — OTA auto-apply helper skipped" >&2
+    return 0
+  fi
+
+  # Prefer packaged units from repo when present; else write inline.
+  local unit_src path_src
+  unit_src="$(script_dir)/../packaging/systemd/tducks-ota-apply.service"
+  path_src="$(script_dir)/../packaging/systemd/tducks-ota-apply.path"
+  if [[ -f "$unit_src" ]]; then
+    install -m 0644 "$unit_src" "$OTA_UNIT_DST"
+  else
+    cat >"$OTA_UNIT_DST" <<EOF
+[Unit]
+Description=Thunderducks OTA apply (install staged binary + restart)
+After=network-online.target
+ConditionPathExists=${DATA_DIR}/ota/pending.json
+
+[Service]
+Type=oneshot
+User=root
+Environment=TD_DATA_DIR=${DATA_DIR}
+Environment=TD_OTA_BIN_PATH=${BIN_DST}
+Environment=TD_OTA_UNIT=tducks.service
+EnvironmentFile=-${CONF_DIR}/tducks.env
+ExecStart=${OTA_HELPER_DST}
+TimeoutStartSec=120
+EOF
+  fi
+  # Rewrite ExecStart/paths for custom prefix installs.
+  sed -i \
+    -e "s|^ExecStart=.*|ExecStart=${OTA_HELPER_DST}|" \
+    -e "s|/var/lib/thunderducks|${DATA_DIR}|g" \
+    -e "s|/usr/bin/tducks|${BIN_DST}|g" \
+    "$OTA_UNIT_DST" || true
+
+  if [[ -f "$path_src" ]]; then
+    install -m 0644 "$path_src" "$OTA_PATH_DST"
+  else
+    cat >"$OTA_PATH_DST" <<EOF
+[Unit]
+Description=Watch Thunderducks OTA pending.json and trigger apply
+
+[Path]
+PathExists=${DATA_DIR}/ota/pending.json
+Unit=tducks-ota-apply.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+  sed -i -e "s|/var/lib/thunderducks|${DATA_DIR}|g" "$OTA_PATH_DST" || true
+
+  systemctl daemon-reload
+  systemctl enable tducks-ota-apply.path
+  systemctl start tducks-ota-apply.path || true
 }
 
 install_from_file() {
@@ -168,17 +248,20 @@ main() {
     download_release
   fi
   install_unit
+  install_ota_helper
   echo
   echo "OK — tducks installed"
   echo "  binary: $BIN_DST"
   echo "  data:   $DATA_DIR"
   echo "  unit:   tducks.service"
+  echo "  ota:    tducks-ota-apply.path (+ .service)"
   echo "  status: systemctl status tducks"
   echo "  logs:   journalctl -u tducks -f"
   echo "  rpc:    curl -s http://${BIND}/health || curl -s http://127.0.0.1:8788/health"
   echo
   echo "Note: default bind is loopback. For LAN clients set TD_BIND in ${CONF_DIR}/tducks.env and open firewall carefully."
   echo "Data dir holds identity.key + claim.json (claim survives restart)."
+  echo "OTA: POST /v1/ota/apply writes pending.json → path unit installs binary + restarts (TD_OTA_AUTO_APPLY)."
 }
 
 main

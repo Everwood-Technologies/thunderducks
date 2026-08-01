@@ -3161,22 +3161,61 @@ fn verify_ota_manifest(m: &OtaManifest) -> Result<(), String> {
         .map_err(|_| "OTA manifest signature invalid".to_string())
 }
 
+fn ota_auto_apply_enabled() -> bool {
+    match std::env::var("TD_OTA_AUTO_APPLY") {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            !(t.is_empty() || t == "0" || t == "false" || t == "no" || t == "off")
+        }
+        // Default on when data dir + path unit are the Pond DIY path.
+        Err(_) => true,
+    }
+}
+
+fn ota_pending_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
+    data.as_ref().map(|d| d.root().join("ota").join("pending.json"))
+}
+
+fn ota_last_apply_path(data: &Option<NodeDataDir>) -> Option<PathBuf> {
+    data.as_ref().map(|d| d.root().join("ota").join("last-apply.json"))
+}
+
 async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
     let g = st.inner.lock().await;
     let mut available = None;
     let mut last_check = None;
     let mut last_error = None;
     let mut staged = None;
+    let mut last_apply = None;
+    let mut last_apply_ok = None;
+    let mut last_apply_ms = None;
+    let mut installed_version = None;
     if let Some(p) = ota_state_path(&g.data_dir) {
         if let Ok(raw) = std::fs::read_to_string(p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 last_check = v.get("last_check_ms").and_then(|x| x.as_u64());
                 last_error = v.get("last_error").and_then(|x| x.as_str()).map(|s| s.to_string());
                 staged = v.get("staged_path").and_then(|x| x.as_str()).map(|s| s.to_string());
+                last_apply = v.get("last_apply").and_then(|x| x.as_str()).map(|s| s.to_string());
+                last_apply_ok = v.get("last_apply_ok").and_then(|x| x.as_bool());
+                last_apply_ms = v.get("last_apply_ms").and_then(|x| x.as_u64());
+                installed_version = v
+                    .get("installed_version")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
                 if let Some(a) = v.get("available") {
                     available = serde_json::from_value::<OtaManifest>(a.clone()).ok();
                 }
             }
+        }
+    }
+    let pending = ota_pending_path(&g.data_dir)
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let mut helper_result = None;
+    if let Some(p) = ota_last_apply_path(&g.data_dir) {
+        if let Ok(raw) = std::fs::read_to_string(p) {
+            helper_result = serde_json::from_str::<serde_json::Value>(&raw).ok();
         }
     }
     Json(serde_json::json!({
@@ -3185,9 +3224,16 @@ async fn ota_status(State(st): State<RpcState>) -> impl IntoResponse {
         "channel": ota_channel(),
         "manifest_url": ota_manifest_url(),
         "signature_required": ota_pubkey().is_some(),
+        "auto_apply": ota_auto_apply_enabled(),
+        "pending": pending,
         "last_check_ms": last_check,
         "available": available,
         "staged_path": staged,
+        "last_apply": last_apply,
+        "last_apply_ok": last_apply_ok,
+        "last_apply_ms": last_apply_ms,
+        "installed_version": installed_version,
+        "helper_result": helper_result,
         "last_error": last_error,
     }))
     .into_response()
@@ -3436,22 +3482,110 @@ async fn ota_apply(State(st): State<RpcState>, headers: HeaderMap) -> impl IntoR
             .into_response();
     }
     let staged = stage_path.display().to_string();
-    let state_path = g.data_dir.as_ref().unwrap().root().join("ota-state.json");
+    let data_root = g.data_dir.as_ref().unwrap().root().to_path_buf();
+    let state_path = data_root.join("ota-state.json");
+    let ota_dir = data_root.join("ota");
+    let pending_path = ota_dir.join("pending.json");
+    let auto = ota_auto_apply_enabled();
+    // Request body: optional restart override via query is not used; env TD_OTA_RESTART default true.
+    let do_restart = match std::env::var("TD_OTA_RESTART") {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            !(t == "0" || t == "false" || t == "no" || t == "off")
+        }
+        Err(_) => true,
+    };
+
+    let mut apply_mode = "staged";
+    let mut apply_note = "Artifact staged only (TD_OTA_AUTO_APPLY=false). Install manually or enable auto-apply.".to_string();
+    let mut pending_written = false;
+    let mut helper_started = false;
+    let mut helper_error: Option<String> = None;
+
+    if auto {
+        let pending = serde_json::json!({
+            "version": manifest.version,
+            "staged_path": staged,
+            "restart": do_restart,
+            "requested_ms": now_ms(),
+        });
+        if let Err(e) = std::fs::write(
+            &pending_path,
+            serde_json::to_vec_pretty(&pending).unwrap_or_default(),
+        ) {
+            helper_error = Some(format!("write pending.json: {e}"));
+        } else {
+            pending_written = true;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o640));
+            }
+            apply_mode = "pending";
+
+            // Best-effort kick if path unit is not watching (dev / partial installs).
+            let kick = tokio::process::Command::new("systemctl")
+                .args(["start", "tducks-ota-apply.service"])
+                .output()
+                .await;
+            match kick {
+                Ok(out) if out.status.success() => {
+                    helper_started = true;
+                    apply_mode = "applying";
+                    apply_note = "tducks-ota-apply.service started (install + restart)".into();
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    // Path unit may pick it up shortly even if start failed (unit missing).
+                    helper_error = Some(if err.is_empty() {
+                        format!("systemctl start exit {}", out.status)
+                    } else {
+                        err
+                    });
+                    apply_note = format!(
+                        "pending.json written; systemctl start failed ({}) — ensure tducks-ota-apply.path is enabled",
+                        helper_error.as_deref().unwrap_or("?")
+                    );
+                }
+                Err(e) => {
+                    helper_error = Some(format!("systemctl not available: {e}"));
+                    apply_note = "pending.json written; no systemctl — run scripts/tducks-ota-apply.sh as root".into();
+                }
+            }
+        }
+    }
+
     let v = serde_json::json!({
         "last_check_ms": now_ms(),
         "available": manifest,
         "staged_path": staged,
-        "last_error": null,
-        "last_apply": "staged — run install script or restart with new binary",
+        "last_error": helper_error,
+        "last_apply": apply_note,
+        "last_apply_ok": pending_written || !auto,
+        "pending": if pending_written {
+            serde_json::json!({
+                "path": pending_path.display().to_string(),
+                "restart": do_restart,
+            })
+        } else {
+            serde_json::Value::Null
+        },
     });
     let _ = std::fs::write(state_path, serde_json::to_vec_pretty(&v).unwrap_or_default());
+    drop(g);
 
     Json(serde_json::json!({
         "ok": true,
         "staged_path": staged,
         "version": manifest.version,
         "bytes": bytes.len(),
-        "note": "Artifact staged. Apply with install-tducks.sh --from-file or operator swap + systemctl restart.",
+        "auto_apply": auto,
+        "restart": do_restart,
+        "pending_written": pending_written,
+        "helper_started": helper_started,
+        "mode": apply_mode,
+        "note": apply_note,
+        "helper_error": helper_error,
     }))
     .into_response()
 }
