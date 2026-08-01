@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Thunderducks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 40rem; }
+      button { margin-right: 0.5rem; margin-top: 0.5rem; }
+      pre { background: #111; color: #eee; padding: 1rem; overflow: auto; }
+      input { min-width: 12rem; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      // For static preview after `npm run build`, point at local node RPC.
+      import { TdRpcClient, mountMinimalUi } from "./dist/rpc.js";
+      const rpc = new URLSearchParams(location.search).get("rpc") || "http://127.0.0.1:8788";
+      mountMinimalUi(document.getElementById("app"), new TdRpcClient(rpc));
+    </script>
+  </body>
+</html>

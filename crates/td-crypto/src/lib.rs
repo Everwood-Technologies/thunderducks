@@ -8,7 +8,7 @@ pub use device::{DeviceBundle, DeviceId, DeviceKeypair};
 pub use e2ee::{
     fanout_megolm_key, E2eeDevice, E2eeError, MegolmCiphertext, OlmCiphertext, OlmDeviceKeys,
 };
-pub use link::{DeviceLinkPayload, LinkError, LinkRegistry};
+pub use link::{DeviceLinkPayload, LinkApproval, LinkError, LinkRegistry, LinkRequest};
 
 /// Crate smoke marker used by CI.
 pub fn crate_name() -> &'static str {

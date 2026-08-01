@@ -6,7 +6,7 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 
 ## Status
 
-**MVP construction** — Waves A–D landed (events, identity, P2P, E2EE, rooms, relay assist, multi-device sync). Wave E next (CLI + web).
+**MVP construction** — Waves A–E landed (core, E2EE, rooms, relay, sync, CLI + TS web RPC). Wave F next (widgets + harness).
 
 | Layer | Choice |
 |-------|--------|

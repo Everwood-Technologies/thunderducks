@@ -274,4 +274,37 @@ impl DeviceNode {
         // create is local authorship; clear outbox if used as bootstrap fixture via remote path
         Ok(())
     }
+
+    /// Room messages in causal-ish order (parent count, then ts).
+    pub fn list_messages(&self, room_id: &RoomId) -> Vec<SignedEvent> {
+        let mut msgs: Vec<SignedEvent> = self
+            .events
+            .values()
+            .filter(|e| e.room_id == *room_id && e.kind == EventKind::Message)
+            .cloned()
+            .collect();
+        msgs.sort_by(|a, b| {
+            a.parents
+                .len()
+                .cmp(&b.parents.len())
+                .then(a.ts_ms.cmp(&b.ts_ms))
+        });
+        msgs
+    }
+
+    pub fn list_events(&self, room_id: &RoomId) -> Vec<SignedEvent> {
+        let mut evs: Vec<SignedEvent> = self
+            .events
+            .values()
+            .filter(|e| e.room_id == *room_id)
+            .cloned()
+            .collect();
+        evs.sort_by(|a, b| {
+            a.parents
+                .len()
+                .cmp(&b.parents.len())
+                .then(a.ts_ms.cmp(&b.ts_ms))
+        });
+        evs
+    }
 }

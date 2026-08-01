@@ -1,6 +1,6 @@
 [package]
 name = "td-node"
-description = "Node runtime: multi-device sync, outbox/inbox, DAG convergence"
+description = "Node runtime: multi-device sync, outbox/inbox, local HTTP RPC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,7 +19,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
