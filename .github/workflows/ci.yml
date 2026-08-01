@@ -42,3 +42,22 @@ jobs:
       - name: build + smoke
         working-directory: clients/web
         run: npm test
+
+  widgets:
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: build tducks binary
+        run: cargo build -p tducks
+      - name: widget-sdk test
+        working-directory: clients/widget-sdk
+        run: npm install && npm test
+      - name: bot test
+        working-directory: clients/bot
+        run: npm test

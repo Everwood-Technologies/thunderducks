@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Honk Widget</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 1rem; }
+      button { font-size: 1rem; padding: 0.4rem 0.8rem; }
+      #log { white-space: pre-wrap; font-size: 0.85rem; background: #111; color: #eee; padding: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <h3>🦆 Honk counter</h3>
+    <p>Granted perms only. Cannot read keys.</p>
+    <button id="honk">Honk in room</button>
+    <button id="steal">Try steal keys</button>
+    <div id="log"></div>
+    <script type="module">
+      const CHANNEL = "td-widget-v1";
+      const widgetId = "honk-counter";
+      let seq = 0;
+      const pending = new Map();
+      const log = (s) => {
+        document.getElementById("log").textContent =
+          s + "\n" + document.getElementById("log").textContent;
+      };
+      function request(method, params = {}) {
+        const id = "r" + ++seq;
+        const p = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+        parent.postMessage({ channel: CHANNEL, type: "request", id, method, params }, "*");
+        return p;
+      }
+      window.addEventListener("message", (ev) => {
+        const m = ev.data;
+        if (!m || m.channel !== CHANNEL) return;
+        if (m.type === "hello") log("hello grants=" + JSON.stringify(m.granted));
+        if (m.type === "result") {
+          const p = pending.get(m.id);
+          if (!p) return;
+          pending.delete(m.id);
+          if (m.ok) p.resolve(m.data);
+          else p.reject(new Error(m.error));
+        }
+      });
+      parent.postMessage({ channel: CHANNEL, type: "ready", widgetId }, "*");
+      const roomId = new URLSearchParams(location.search).get("room") || "";
+      document.getElementById("honk").onclick = async () => {
+        try {
+          const r = await request("room.send", { roomId, text: "honk!" });
+          log("sent " + JSON.stringify(r));
+        } catch (e) {
+          log("send err " + e.message);
+        }
+      };
+      document.getElementById("steal").onclick = async () => {
+        try {
+          const r = await request("keys.read", {});
+          log("UNEXPECTED " + JSON.stringify(r));
+        } catch (e) {
+          log("steal blocked: " + e.message);
+        }
+      };
+    </script>
+  </body>
+</html>

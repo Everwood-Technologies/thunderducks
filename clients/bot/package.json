@@ -1,0 +1,11 @@
+{
+  "name": "@thunderducks/bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sample bot using public node RPC only (no key access)",
+  "scripts": {
+    "start": "node src/honk-bot.js",
+    "test": "node --test src/honk-bot.test.js"
+  }
+}

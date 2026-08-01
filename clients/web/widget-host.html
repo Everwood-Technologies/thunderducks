@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Thunderducks Widget Host</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 48rem; }
+      iframe { width: 100%; height: 220px; border: 1px solid #ccc; border-radius: 8px; }
+      pre { background: #111; color: #eee; padding: 0.75rem; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>Widget host</h1>
+    <p>Demo iframe with deny-by-default bridge. RPC: <code id="rpc"></code></p>
+    <button id="boot">Create room + load widget</button>
+    <iframe id="frame" sandbox="allow-scripts" title="widget"></iframe>
+    <pre id="log"></pre>
+    <script type="module">
+      import { TdRpcClient } from "./dist/rpc.js";
+
+      const CHANNEL = "td-widget-v1";
+      const rpcUrl = new URLSearchParams(location.search).get("rpc") || "http://127.0.0.1:8788";
+      document.getElementById("rpc").textContent = rpcUrl;
+      const log = (s) => {
+        const el = document.getElementById("log");
+        el.textContent = s + "\n" + el.textContent;
+      };
+      const client = new TdRpcClient(rpcUrl);
+      let roomId = "";
+      const granted = ["room.send", "room.read", "device.public_id"];
+
+      window.addEventListener("message", async (ev) => {
+        const m = ev.data;
+        if (!m || m.channel !== CHANNEL) return;
+        if (m.type === "ready") {
+          log("widget ready");
+          ev.source?.postMessage(
+            { channel: CHANNEL, type: "hello", widgetId: "honk-counter", granted },
+            "*",
+          );
+          return;
+        }
+        if (m.type !== "request") return;
+        const reply = (ok, dataOrErr) => {
+          ev.source?.postMessage(
+            ok
+              ? { channel: CHANNEL, type: "result", id: m.id, ok: true, data: dataOrErr }
+              : { channel: CHANNEL, type: "result", id: m.id, ok: false, error: dataOrErr },
+            "*",
+          );
+        };
+        // hard deny keys
+        if (String(m.method).startsWith("keys.") || String(m.method).includes("private")) {
+          log("DENY " + m.method);
+          reply(false, "permission denied: " + m.method);
+          return;
+        }
+        if (!granted.includes(m.method) && m.method !== "device.public_id") {
+          // map method name to permission equality for demo
+        }
+        try {
+          if (m.method === "room.send") {
+            if (!granted.includes("room.send")) throw new Error("missing permission");
+            const r = await client.send(m.params.roomId || roomId, m.params.text || "");
+            reply(true, r);
+          } else if (m.method === "room.read") {
+            if (!granted.includes("room.read")) throw new Error("missing permission");
+            const r = await client.listMessages(m.params.roomId || roomId);
+            reply(true, r.messages);
+          } else if (m.method === "device.public_id") {
+            if (!granted.includes("device.public_id")) throw new Error("missing permission");
+            const st = await client.status();
+            reply(true, { device_id: st.device_id });
+          } else {
+            reply(false, "unknown or denied: " + m.method);
+          }
+        } catch (e) {
+          reply(false, e.message || String(e));
+        }
+      });
+
+      document.getElementById("boot").onclick = async () => {
+        const st = await client.status();
+        log("device " + st.device_id.slice(0, 12));
+        const room = await client.createRoom("widget-pond");
+        roomId = room.room_id;
+        log("room " + roomId.slice(0, 12));
+        const src = new URL("../widget-sdk/demo/honk-widget.html", location.href);
+        src.searchParams.set("room", roomId);
+        document.getElementById("frame").src = src.toString();
+      };
+    </script>
+  </body>
+</html>

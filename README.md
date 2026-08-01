@@ -6,7 +6,7 @@ Event-driven, maximally decentralized hybrid P2P **E2EE** chat — no tokens, no
 
 ## Status
 
-**MVP construction** — Waves A–E landed (core, E2EE, rooms, relay, sync, CLI + TS web RPC). Wave F next (widgets + harness).
+**MVP construction** — Waves A–F landed (core through widgets/bot/harness). MVP vertical slice complete (M5).
 
 | Layer | Choice |
 |-------|--------|
@@ -31,11 +31,22 @@ crates/
 relays/
   td-relay/     optional assist relay
 clients/
-  web/          TS client (soon)
-  widget-sdk/   JS SDK (soon)
+  web/          TS client + widget host
+  widget-sdk/   iframe postMessage SDK (deny-by-default)
+  bot/          sample bot (public RPC only)
 docs/
   threat-model.md
   architecture.md
+  bench.md
+scripts/
+  dev-harness.sh
+```
+
+## Dev harness
+
+```bash
+./scripts/dev-harness.sh
+# optional relay: WITH_RELAY=1 ./scripts/dev-harness.sh
 ```
 
 ## Quick start
@@ -43,7 +54,9 @@ docs/
 ```bash
 # Rust 1.75+ recommended
 cargo test --workspace
-cargo run -p tducks
+cargo run -p tducks -- serve --bind 127.0.0.1:8788
+# another terminal:
+cargo run -p tducks -- --rpc http://127.0.0.1:8788 smoke
 ```
 
 ## Non-goals (MVP)
